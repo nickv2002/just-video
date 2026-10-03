@@ -20,6 +20,12 @@ The install now keeps the old binary as `~/Applications/JustVideo/just-video.pre
 
 ## What to test
 
+**First, since the afternoon install:** the app now uses the Frame controllers' own input profile,
+not SteamVR's Index mapping. Every binding changed, not only the D-pad. Check pointing, trigger
+(select), A and B (back) before the D-pad. If the basics misbehave, roll back over SSH with
+`scripts/frame-ssh.sh 'cd ~/Applications/JustVideo && mv just-video.prev just-video'`,
+and send `grep -E "OpenXR|Input" ~/.local/state/just-video/log.txt`.
+
 1. **Steam art.** The library shows a poster (600×900), and the game page shows a banner and icon.
    If nothing shows, restart Steam. If it still doesn't show, the install prints the app id it used; compare it with the
    file name Steam writes into `userdata/*/config/grid/` when you set custom art by hand.
@@ -52,10 +58,11 @@ The install now keeps the old binary as `~/Applications/JustVideo/just-video.pre
 ## Timing data (please grab after testing)
 
 ```sh
-FRAME_HOST=10.35.78.1 scripts/frame-ssh.sh 'grep -E "Timing:|Input:" ~/Applications/JustVideo/just-video.log'
+# Started from Steam, the app logs to ~/.local/state/just-video/log.txt (previous run: log.previous.txt).
+scripts/frame-ssh.sh 'grep -E "Timing|Input|OpenXR" ~/.local/state/just-video/log.txt'
 # Benchmark without the headset UI (URL user/host must match `just-video servers`):
-FRAME_HOST=10.35.78.1 scripts/frame-ssh.sh '~/Applications/JustVideo/just-video servers'
-FRAME_HOST=10.35.78.1 scripts/frame-ssh.sh '~/Applications/JustVideo/just-video bench-seek "smb://USER@10.35.78.21/SHARE/path/video.mp4" 2>&1'
+scripts/frame-ssh.sh '~/Applications/JustVideo/just-video servers'
+scripts/frame-ssh.sh '~/Applications/JustVideo/just-video bench-seek "smb://nick@n5.local/undupe/path/video.mp4" 2>&1'
 ```
 
 Still unknown until measured on the headset:
@@ -128,7 +135,8 @@ Fixes, 6K60 VR180 HEVC (6144×3072):
    that took ~11 ms of each frame. Per frame, the loop's own work went from **14 ms to 4 ms**. Before,
    it was over budget at 90 and 120 Hz; that may be why SteamVR throttles the app.
    Two frames are now in flight (their own command buffers, fences, staging buffers and colour
-   uniforms). Screenshots taken before and after match.
+   uniforms). Screenshots of two 6K VR videos rendered with the new code are correct: no tearing
+   or stale picture. (None was taken with the old code to compare against.)
 3. **Smoother pacing.** The audio position runs in a ~7 ms sawtooth every 1.5 s. The video clock
    followed it, so a frame was shown twice and the next skipped every second or two
    (0–3 per 5 s). Now the clock follows the audio closely for 1.5 s after a start, jump or pause.
@@ -153,7 +161,8 @@ Still to look at:
   show it. Check `Timing:` in the log after a real session.
 - Copying each picture costs 2 ms of CPU and 1.5 ms of GPU at 6K. Importing the decoder's buffers
   straight into Vulkan would remove both, but needs larger changes, and the frame budget doesn't need it now.
-- SteamVR may stop throttling the app now that it keeps up. Resetting Just Video's
-  per-app "throttling" setting in SteamVR would let it run at 120 Hz.
+- **Not measured at 120 Hz.** Every Steam-launched run went at 60 Hz (throttled). With ~4 ms of
+  loop work and 5 ms of GPU per frame, 120 Hz (8.3 ms) should now fit: expected, not shown.
+  Resetting Just Video's per-app "throttling" setting in SteamVR would show it.
 - My browser-mode test (run without a terminal) rotated the app log, so the log from before
   00:40 is gone. `log.previous.txt` is now the 00:40 session.
