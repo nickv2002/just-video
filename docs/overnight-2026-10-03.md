@@ -143,6 +143,9 @@ Steady state now, through a Steam launch:
 | 1440p60 AV1 10-bit (CPU decode) | 60 Hz | 0 | 301–302 | ~1.8 ms | 2 ms |
 | 1080p30 H.264 | 60 Hz | 0 | 151, 0 skipped | ~1.4 ms | — |
 
+**Installed on the headset** (12:01; build `1aeeb6b`). To roll back, in `~/Applications/JustVideo`:
+`just-video.prev` is this morning's build, and `just-video.pre-overnight` is the original from before last night.
+
 Still to look at:
 - **The first second of a video misses ~20 display periods.** During those frames our loop's
   work is small, and `xrEndFrame` blocks for up to 13 ms. This is probably SteamVR's launch
