@@ -222,3 +222,68 @@ matches Steam's volume slider.
 **Installed on the headset (evening):** the latest commit on this branch. To roll back, in
 `~/Applications/JustVideo`: `just-video.prev` has the jump fix only (old app volume, no D-pad menus),
 and `just-video.pre-overnight` is the original from before last night. This morning's build is gone.
+
+## Afternoon: faster folders and opening (SMB)
+
+**Status:** committed on `overnight/integration` and installed on the headset (14:30). To roll back,
+in `~/Applications/JustVideo`: `mv just-video.prev just-video` (the evening build). Tests: 94 + 7;
+clippy and fmt pass.
+
+Measured on the headset over the home Wi-Fi, with a test binary (`just-video.test`) run next to the
+installed one. `library-stress` runs the app's own library workers without the headset UI.
+
+**Where the time went before.** A 13-video folder took ~3.5 s to mark, one video at a time, and
+again on every visit. Opening a video spent ~30 ms connecting and ~50 ms opening the file before
+reading anything.
+
+1. **Folder marks are remembered** (`~/.config/just-video/probe-cache.json`). A folder seen
+   before is marked in **5 ms instead of ~3.5 s**, also after a restart. The cache keeps what the
+   header says (codec, size, bit depth…), not the verdict, so playability rule changes apply at
+   once. A file whose size or modification time changed is read again. Errors are never kept.
+   Rename and delete keep it up to date. The old binary ignores the file.
+2. **New folders: 3 videos read at once.** This helps less than hoped: 3.7 s → 3.35 s (median of 4
+   alternating pairs). Probing is mostly bandwidth: FFmpeg reads each MP4's index, 1–11 MiB per file,
+   45 MiB for this folder. Limiting FFmpeg's frame-rate probing (`fpsprobesize`) changed neither
+   the bytes nor the results. Probes now pause mid-file when a video opens, and run again after it
+   closes: clicking right after entering a new folder costs nothing extra (the open's probe waited
+   104 ms with 3 workers, 126 ms with 1). After that video closed, the paused probes finished: all
+   13 videos were marked 3.2 s later.
+3. **Opening connects to the share directly, both connections at once.** "open file": **48 → 5 ms**.
+4. **Standby connections.** When a folder with videos shows (and when a video ends), two
+   connections sign in to its share in the background. Opening uses them: "connect": **~30 → 0 ms**.
+   They're used for up to 10 minutes. If they fail to open the video within 2 s
+   (server restarted, headset slept), it connects again as before. The log line says `warm connections`.
+   Together with 3., opening spends **~7 ms instead of ~77 ms** before reading the file (medians of 12 opens).
+5. **A cached folder doesn't stall a frame.** All its marks arrive at once. The rows are now rebuilt
+   once, not once per video (2000 videos: 10 ms instead of 1.6 s in a debug test).
+6. **The log now times folders:** `Timing: folder NAME: listed in N ms, M videos marked in N ms (K from cache)`.
+   `just-video info` also prints what probing read.
+
+**What's left when opening** (6K VR180 and 1080p files): the header probe, ~110–150 ms waiting for
+the network. The folder probe read the same bytes earlier, but the cache keeps facts, not bytes.
+Next candidate: prepare the video the pointer rests on (open it and read its header before the
+click). Not built: it's speculative network work, and it needs care so it doesn't block renaming the
+pointed-at file.
+
+**Tried and shelved: smaller first reads after a jump** (the jumped-to 1 MiB block as 4 × 256 KiB parts).
+Over 6 alternating runs the jump times varied more between runs of the same binary (166–332 ms)
+than between binaries. No measurable gain, so not kept.
+
+**Not measured:**
+- Whether 3 probe threads cost the browser display periods (`Timing: frames` only runs while playing).
+- Unexplained, twice, on both the installed and the test binary: the first `bench-seek` right after
+  another one spent ~4.5 s in "open decoder". It wasn't seen inside the app.
+
+`library-stress` gained `--cold` (forget the probe cache), `--warm` and `--click-at-once`, and
+`JUST_VIDEO_PROBE_WORKERS=N` sets how many probes run at once, for comparing.
+
+**To test (in the headset; `library-stress` doesn't run the browser screens):**
+1. Enter a folder, go up, enter it again: the marks appear at once.
+2. Open a video from it: it starts as before (the log says `warm connections`).
+3. Rename a video (server unlocked): its mark stays.
+4. Enter a folder never seen before and pick a video at once: it plays normally. After you back out,
+   the rest of the marks fill in.
+
+```sh
+scripts/frame-ssh.sh 'grep -E "Timing: (folder|open)|warm|Probe cache|Library" ~/.local/state/just-video/log.txt'
+```
