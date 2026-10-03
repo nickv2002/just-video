@@ -151,6 +151,11 @@ Steady state now, through a Steam launch:
 | 1440p60 AV1 10-bit (CPU decode) | 60 Hz | 0 | 301–302 | ~1.8 ms | 2 ms |
 | 1080p30 H.264 | 60 Hz | 0 | 151, 0 skipped | ~1.4 ms | — |
 
+**9-minute soak** (6K60 VR180, Steam launch, 60 Hz, 3408² eyes): after the first 5 s, every
+5-s window had 0 missed periods and 0 skipped frames. GPU time (eyes 3.5 ms, worst 5.1) and loop
+work (~4 ms) stayed flat. The hottest sensor went from 54 °C to 59 °C. Panel updates (notices,
+captions) cost 2–4 ms of the loop, text rendering included, and missed no periods.
+
 **Installed on the headset** (12:01; build `1aeeb6b`). To roll back, in `~/Applications/JustVideo`:
 `just-video.prev` is this morning's build, and `just-video.pre-overnight` is the original from before last night.
 
