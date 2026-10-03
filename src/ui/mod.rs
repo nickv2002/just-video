@@ -6,6 +6,7 @@ pub mod captions;
 pub mod controls;
 pub mod form;
 pub mod navigator;
+pub mod settings;
 pub mod steam_art;
 
 /// Saves a canvas as PNG (UI previews and tests).
