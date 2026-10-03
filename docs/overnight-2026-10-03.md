@@ -155,8 +155,7 @@ Steady state now, through a Steam launch:
 work (~4 ms) stayed flat. The hottest sensor went from 54 °C to 59 °C. Panel updates (notices,
 captions) cost 2–4 ms of the loop, text rendering included, and missed no periods.
 
-**Installed on the headset** (12:01; build `1aeeb6b`). To roll back, in `~/Applications/JustVideo`:
-`just-video.prev` is this morning's build, and `just-video.pre-overnight` is the original from before last night.
+**Installed on the headset:** see the end of these notes (the evening build replaced the 12:01 one).
 
 Still to look at:
 - **The first second of a video misses ~20 display periods.** During those frames our loop's
@@ -217,3 +216,7 @@ matches Steam's volume slider.
 4. While playing, open the track dialog, pick a track with the D-pad and A, then B (the video should keep playing).
 5. Press D-pad up/down while playing and compare with Steam's volume.
 6. Jump forward quickly on the episode that used to stop.
+
+**Installed on the headset (evening):** the latest commit on this branch. To roll back, in
+`~/Applications/JustVideo`: `just-video.prev` has the jump fix only (old app volume, no D-pad menus),
+and `just-video.pre-overnight` is the original from before last night. This morning's build is gone.
