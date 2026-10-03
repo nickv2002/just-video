@@ -198,7 +198,9 @@ matches Steam's volume slider.
 **D-pad in menus.**
 - In the browser:
   - Any D-pad press shows a focus (the same highlight as pointing).
-  - Up/down move row by row and scroll the list; left/right reach a row's buttons (Rename, Delete, lock…).
+  - Up/down move row by row and scroll the list. Right on a folder or share opens it (let go
+    before it opens the next one); on rows with buttons (servers, edit mode) left/right reach
+    the buttons (Rename, Delete, Edit, lock…).
   - Up from the first row reaches the breadcrumbs and header buttons.
   - A (or the trigger) clicks; B goes back one level (it already did).
 - In dialogs, focus starts on the safe button (Cancel, never Delete).
