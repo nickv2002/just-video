@@ -130,6 +130,133 @@ fn load_sidecars(session: &SmbSession, share: &str, path: &Path) -> Vec<External
         .collect()
 }
 
+/// Phase times of opening a video, logged as one `Timing:` line.
+pub struct OpenTiming {
+    requested: std::time::Instant,
+    last: std::time::Instant,
+    phases: Vec<(&'static str, f64)>,
+    notes: Vec<String>,
+}
+
+impl OpenTiming {
+    pub fn new(requested: std::time::Instant) -> Self {
+        Self {
+            requested,
+            last: std::time::Instant::now(),
+            phases: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// Ends the phase that started at the last lap.
+    pub fn lap(&mut self, phase: &'static str) {
+        let now = std::time::Instant::now();
+        self.phases
+            .push((phase, (now - self.last).as_secs_f64() * 1e3));
+        self.last = now;
+    }
+
+    pub fn note(&mut self, note: String) {
+        self.notes.push(note);
+    }
+
+    /// Milliseconds spent in `phase`.
+    pub fn phase_ms(&self, phase: &str) -> Option<f64> {
+        self.phases.iter().find(|p| p.0 == phase).map(|p| p.1)
+    }
+
+    pub fn phases(&self) -> Vec<(String, f64)> {
+        self.phases
+            .iter()
+            .map(|(p, ms)| (p.to_string(), *ms))
+            .collect()
+    }
+
+    pub fn total_ms(&self) -> f64 {
+        self.requested.elapsed().as_secs_f64() * 1e3
+    }
+
+    pub fn log(&self, name: &str) {
+        let phases: Vec<String> = self
+            .phases
+            .iter()
+            .map(|(p, ms)| format!("{p} {ms:.0}"))
+            .chain(self.notes.iter().cloned())
+            .collect();
+        eprintln!(
+            "Timing: open {name}: {:.0} ms ({})",
+            self.total_ms(),
+            phases.join(", ")
+        );
+    }
+}
+
+/// Opens `path` on its own `session` for playback: subtitles next to it,
+/// the file, its streams, then the decoder.
+pub fn open_video(
+    session: &Arc<SmbSession>,
+    share: &str,
+    path: &Path,
+    key: String,
+    hw: Option<&str>,
+    timing: &mut OpenTiming,
+) -> Result<Box<Opened>, String> {
+    let err = |e: anyhow::Error| format!("{e:#}");
+    let name = path.last().cloned().unwrap_or_default();
+    // Subtitle files load alongside: their folder listing and reads are
+    // round trips the video doesn't need to wait for.
+    let (external_subtitles, media) = std::thread::scope(|scope| {
+        let sidecars = scope.spawn(|| {
+            let started = std::time::Instant::now();
+            let found = load_sidecars(session, share, path);
+            (found, started.elapsed().as_secs_f64() * 1e3)
+        });
+        let media = session
+            .open_owned(share, &smb_path(path), ReadAhead::default())
+            .map_err(err)
+            .and_then(|reader| {
+                timing.lap("open file");
+                Media::open(&name, reader).map_err(err)
+            });
+        timing.lap("probe");
+        let (found, ms) = sidecars.join().unwrap_or_default();
+        timing.lap("rest of sidecars");
+        timing.note(format!("sidecars {ms:.0} alongside"));
+        (found, media)
+    });
+    let media = media?;
+    timing.note(format!("probe read {}", media.io()));
+    let video = media.info().video.clone();
+    let assessment = playability::assess(Platform::current(), video.as_ref());
+    let mut layout = vr::detect(&name, video.as_ref());
+    let saved = config::layout_override(&key).ok().flatten();
+    if let Some(saved) = saved {
+        saved.apply(&mut layout);
+    }
+    let image = saved.map(|s| s.image).unwrap_or_default();
+    // The last video's decoder closes in the background; wait for
+    // it, or the hardware decoder is still busy.
+    if !crate::media::wait_for_decoders_closed(std::time::Duration::from_secs(10)) {
+        eprintln!("Library: the previous video's decoder is still closing");
+    }
+    timing.lap("wait for last decoder");
+    let mut decoder = media.into_decoder(hw, true, "").map_err(err)?;
+    timing.lap("open decoder");
+    decoder.requested_at = Some(timing.requested);
+    let resume = config::resume_position(&key);
+    timing.log(&name);
+    Ok(Box::new(Opened {
+        decoder,
+        layout,
+        assessment,
+        name,
+        key,
+        external_subtitles,
+        image,
+        resume,
+    }))
+}
+
 pub enum Response {
     Shares {
         id: u64,
@@ -165,8 +292,8 @@ pub struct Probed {
 }
 
 pub struct Library {
-    main: mpsc::Sender<Request>,
-    probes: mpsc::Sender<Request>,
+    main: mpsc::Sender<(Request, std::time::Instant)>,
+    probes: mpsc::Sender<(Request, std::time::Instant)>,
     responses: mpsc::Receiver<Response>,
     /// Probes for other generations (folders left behind) are skipped.
     probe_generation: Arc<AtomicU64>,
@@ -238,7 +365,12 @@ fn smb_path(path: &Path) -> String {
     path.join("\\")
 }
 
-fn handle(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
+fn handle(
+    request: Request,
+    requested: std::time::Instant,
+    sessions: &Sessions,
+    hw: Option<&str>,
+) -> Response {
     let started = std::time::Instant::now();
     let (server, what) = match &request {
         Request::Shares { server, .. } => (server.clone(), "shares"),
@@ -249,7 +381,7 @@ fn handle(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
         Request::Delete { server, .. } => (server.clone(), "delete"),
         Request::AddServer { server, .. } => (server.clone(), "add server"),
     };
-    let response = run(request, sessions, hw);
+    let response = run(request, requested, sessions, hw);
     let failure = match &response {
         Response::Shares { result: Err(e), .. }
         | Response::List { result: Err(e), .. }
@@ -301,7 +433,12 @@ fn connection_lost(error: &str) -> bool {
     .any(|marker| error.contains(marker))
 }
 
-fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
+fn run(
+    request: Request,
+    requested: std::time::Instant,
+    sessions: &Sessions,
+    hw: Option<&str>,
+) -> Response {
     let err = |e: anyhow::Error| format!("{e:#}");
     match request {
         Request::Shares { id, server } => Response::Shares {
@@ -360,40 +497,11 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
         } => {
             // A dedicated connection per video: if it wedges, only this video
             // is affected, and it closes when the video does.
-            let key = file_key(&server, &share, &path);
+            let mut timing = OpenTiming::new(requested);
             let result = connect(&server, None).and_then(|s| {
-                let external_subtitles = load_sidecars(&s, &share, &path);
-                let reader = s
-                    .open_owned(&share, &smb_path(&path), ReadAhead::default())
-                    .map_err(err)?;
-                let media =
-                    Media::open(path.last().map_or("", String::as_str), reader).map_err(err)?;
-                let name = path.last().cloned().unwrap_or_default();
-                let video = media.info().video.clone();
-                let assessment = playability::assess(Platform::current(), video.as_ref());
-                let mut layout = vr::detect(&name, video.as_ref());
-                let saved = config::layout_override(&key).ok().flatten();
-                if let Some(saved) = saved {
-                    saved.apply(&mut layout);
-                }
-                let image = saved.map(|s| s.image).unwrap_or_default();
-                // The last video's decoder closes in the background; wait for
-                // it, or the hardware decoder is still busy.
-                if !crate::media::wait_for_decoders_closed(std::time::Duration::from_secs(10)) {
-                    eprintln!("Library: the previous video's decoder is still closing");
-                }
-                let decoder = media.into_decoder(hw, true, "").map_err(err)?;
-                let resume = config::resume_position(&key);
-                Ok(Box::new(Opened {
-                    decoder,
-                    layout,
-                    assessment,
-                    name,
-                    key,
-                    external_subtitles,
-                    image,
-                    resume,
-                }))
+                timing.lap("connect");
+                let key = file_key(&server, &share, &path);
+                open_video(&s, &share, &path, key, hw, &mut timing)
             });
             Response::Opened { id, result }
         }
@@ -452,27 +560,52 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
     }
 }
 
+/// Holds a probe while a video opens or plays: probes read other files over
+/// the same link (and disks), slowing the video. False when the probe's
+/// folder was left meanwhile.
+fn wait_for_quiet(current: &AtomicU64, generation: u64, opening: &AtomicU64) -> bool {
+    loop {
+        if generation != current.load(Ordering::Relaxed) {
+            return false;
+        }
+        if opening.load(Ordering::SeqCst) == 0 && crate::media::open_decoders() == 0 {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 impl Library {
     /// `hw` is the preferred hardware backend for playback (see `media::default_hw_backend`).
     pub fn start(hw: Option<&'static str>) -> Self {
         let sessions: Sessions = Default::default();
         let probe_generation = Arc::new(AtomicU64::new(0));
+        let opening = Arc::new(AtomicU64::new(0));
         let (response_tx, responses) = mpsc::channel();
         let mut senders = Vec::new();
         for name in ["library", "probe"] {
-            let (tx, rx) = mpsc::channel::<Request>();
+            let (tx, rx) = mpsc::channel::<(Request, std::time::Instant)>();
             let (sessions, out) = (sessions.clone(), response_tx.clone());
             let current = probe_generation.clone();
+            let opening = opening.clone();
             std::thread::Builder::new()
                 .name(name.into())
                 .spawn(move || {
-                    for request in rx {
+                    for (request, requested) in rx {
                         if let Request::Probe { generation, .. } = &request
-                            && *generation != current.load(Ordering::Relaxed)
+                            && !wait_for_quiet(&current, *generation, &opening)
                         {
                             continue;
                         }
-                        if out.send(handle(request, &sessions, hw)).is_err() {
+                        let open = matches!(request, Request::Open { .. });
+                        if open {
+                            opening.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let response = handle(request, requested, &sessions, hw);
+                        if open {
+                            opening.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        if out.send(response).is_err() {
                             return;
                         }
                     }
@@ -501,7 +634,7 @@ impl Library {
         } else {
             &self.main
         };
-        let _ = worker.send(request);
+        let _ = worker.send((request, std::time::Instant::now()));
     }
 
     pub fn try_recv(&self) -> Option<Response> {

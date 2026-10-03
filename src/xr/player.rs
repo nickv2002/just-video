@@ -95,6 +95,131 @@ mod tests {
         [0, 1, 2].map(|i| (0..3).map(|k| m[k][i] * v[k]).sum())
     }
 
+    fn situation(target: f64, from: f64) -> SeekSituation {
+        SeekSituation {
+            target,
+            from,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn short_jumps_are_exact() {
+        let mut s = situation(110.0, 100.0);
+        s.key_before = Some(108.0);
+        s.key_after = Some(112.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+        s.target = 90.0;
+        s.key_before = Some(89.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+        // Nothing known about keyframes.
+        assert_eq!(plan_seek(&situation(110.0, 100.0)), SeekPlan::Exact);
+    }
+
+    #[test]
+    fn short_jumps_far_from_a_keyframe_snap_but_keep_their_direction() {
+        // +10 s with the keyframe 6 s before the target: the one after is nearer.
+        let mut s = situation(110.0, 100.0);
+        s.key_before = Some(104.0);
+        s.key_after = Some(112.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(112.0));
+        // Nearest would be behind where we are: take the other one.
+        s.key_before = Some(99.0);
+        s.key_after = Some(130.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(130.0));
+        // -10 s: the nearest keyframe is past where we are, so the one before.
+        let mut s = situation(90.0, 100.0);
+        s.key_before = Some(80.0);
+        s.key_after = Some(101.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(80.0));
+        // No keyframe after the target known: exact.
+        let mut s = situation(110.0, 100.0);
+        s.key_before = Some(95.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+        // The hardware decoder catches up fast enough to stay exact,
+        // and to decode on further.
+        s.key_after = Some(112.0);
+        s.hardware = true;
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+        s.decoded = Some(100.5);
+        assert_eq!(plan_seek(&s), SeekPlan::Continue);
+        s.decoded = None;
+        // ...but long jumps still land on a keyframe.
+        s.target = 700.0;
+        s.key_before = Some(695.0);
+        s.key_after = Some(701.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(701.0));
+    }
+
+    #[test]
+    fn no_keyframe_in_between_keeps_decoding() {
+        // Decoded up to 101 s, next keyframe after 110 s: just go on.
+        let mut s = situation(103.0, 100.5);
+        s.decoded = Some(101.0);
+        s.key_before = Some(98.0);
+        s.key_after = Some(110.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Continue);
+        // Too far to decode on quickly (and to the keyframe before): snap.
+        s.target = 105.0;
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(110.0));
+        s.target = 103.0;
+        // An index that knows nothing past the target may be incomplete.
+        s.key_after = None;
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+        s.key_after = Some(110.0);
+        // A keyframe past the decoder: jumping there is cheaper.
+        s.key_before = Some(103.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+        // Backwards always jumps.
+        s.target = 99.0;
+        s.key_before = Some(98.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+        // Without an index, nothing is known: jump.
+        s.target = 105.0;
+        s.key_before = None;
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+        // Very long GOPs: jump rather than decode on for a long time.
+        let mut s = situation(130.0, 100.0);
+        s.decoded = Some(101.0);
+        s.key_before = Some(98.0);
+        s.key_after = Some(140.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(140.0));
+    }
+
+    #[test]
+    fn long_jumps_land_on_the_nearest_keyframe() {
+        let mut s = situation(700.0, 100.0);
+        s.key_before = Some(691.0);
+        s.key_after = Some(702.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(702.0));
+        s.key_after = Some(712.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(691.0));
+        // Backwards too.
+        let mut s = situation(100.0, 700.0);
+        s.key_before = Some(90.0);
+        s.key_after = Some(101.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(101.0));
+        // An index that only knows what was read so far (Matroska before its
+        // first seek) has nothing after the target: exact, not back to 0.
+        let mut s = situation(700.0, 100.0);
+        s.key_before = Some(2.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+        assert_eq!(plan_seek(&situation(700.0, 100.0)), SeekPlan::Exact);
+    }
+
+    #[test]
+    fn resume_lands_on_the_keyframe_before() {
+        let mut s = situation(1200.0, 0.0);
+        s.resume = true;
+        s.key_before = Some(1195.0);
+        s.key_after = Some(1201.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(1195.0));
+        // Only the start indexed so far (Matroska): exact.
+        s.key_before = Some(0.0);
+        s.key_after = None;
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+    }
+
     #[test]
     fn placement_turns_the_screen_direction() {
         let mut p = Placement {
@@ -128,6 +253,8 @@ pub struct PlayStats {
 
 enum Decoded {
     Frame(u64, Frame),
+    /// The keyframe a seek landed on, shown while decoding on to the target.
+    Preview(u64, Frame),
     End(u64),
     Failed(u64, String),
 }
@@ -225,9 +352,183 @@ fn spawn_audio(
         .expect("spawn audio thread");
 }
 
+/// A jump requested by the viewer.
+struct SeekRequest {
+    generation: u64,
+    target: f64,
+    /// The position shown when it was asked for.
+    from: f64,
+    /// Continuing where the viewer left the video last time.
+    resume: bool,
+    requested: Instant,
+}
+
+/// How the decoder reaches a seek target.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SeekPlan {
+    /// No keyframe between the decoder and the target: decode on to it.
+    /// Cheaper than jumping back to the same keyframe (or an earlier one).
+    Continue,
+    /// Jump to the keyframe before the target and decode up to it.
+    Exact,
+    /// Jump to this keyframe and play from there: after a long jump nobody
+    /// misses a few seconds, but decoding them can take seconds with long
+    /// GOPs (10 s in some films) on the headset's CPU.
+    Keyframe(f64),
+}
+
+/// What [`plan_seek`] decides from.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SeekSituation {
+    pub target: f64,
+    /// The position shown when the jump was asked for.
+    pub from: f64,
+    /// Time of the last frame decoded since the last jump, if any.
+    pub decoded: Option<f64>,
+    /// Keyframes around the target from the file's index, if it has one.
+    pub key_before: Option<f64>,
+    pub key_after: Option<f64>,
+    pub resume: bool,
+    /// Decoding on the hardware decoder, which catches up quickly.
+    pub hardware: bool,
+}
+
+/// Jumps at least this long land on the nearest keyframe (see `SeekPlan::Keyframe`).
+pub const KEYFRAME_SEEK_FROM: f64 = 60.0;
+/// Shorter jumps are exact unless, decoding on the CPU, their keyframe is
+/// further than this before the target: decoding up to it would take too long
+/// (a 10 s GOP of 4K HEVC is 240 frames, ~0.7 s on the headset even skipping
+/// non-reference frames). The hardware decoder runs 40-75x real time.
+const EXACT_GAP: f64 = 3.0;
+
+pub fn plan_seek(s: &SeekSituation) -> SeekPlan {
+    // An index still being built while reading (Matroska before its first
+    // seek) knows no keyframe after the target, and may miss some before it.
+    // On the CPU, decoding on is as slow as an exact jump beyond `EXACT_GAP`.
+    let reach = if s.hardware {
+        KEYFRAME_SEEK_FROM
+    } else {
+        EXACT_GAP
+    };
+    if let (Some(decoded), Some(key), Some(_)) = (s.decoded, s.key_before, s.key_after)
+        && decoded < s.target
+        && s.target - decoded <= reach
+        && key <= decoded
+    {
+        return SeekPlan::Continue;
+    }
+    let jump = s.target - s.from;
+    let exact_is_quick = s.hardware || s.key_before.is_none_or(|key| s.target - key <= EXACT_GAP);
+    if !s.resume && jump.abs() < KEYFRAME_SEEK_FROM && exact_is_quick {
+        return SeekPlan::Exact;
+    }
+    // Only an index with keyframes on both sides is trusted to be complete here.
+    let (Some(before), Some(after)) = (s.key_before, s.key_after) else {
+        return SeekPlan::Exact;
+    };
+    if s.resume {
+        // Never past the point left: it is already rewound a little.
+        return SeekPlan::Keyframe(before);
+    }
+    // The nearest keyframe that still moves the way the viewer asked.
+    let nearest = if after - s.target < s.target - before {
+        [after, before]
+    } else {
+        [before, after]
+    };
+    nearest
+        .into_iter()
+        .find(|&key| {
+            if jump >= 0.0 {
+                key > s.from
+            } else {
+                key < s.from
+            }
+        })
+        .map_or(SeekPlan::Exact, SeekPlan::Keyframe)
+}
+
+/// A seek whose keyframe is at least this far before the target shows the
+/// keyframe while decoding on.
+const PREVIEW_GAP: f64 = 0.5;
+
+/// How the last seek (or the start) went, for logs and `bench-seek`.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct SeekReport {
+    #[serde(skip)]
+    pub generation: u64,
+    pub target: f64,
+    /// How the decoder got there: "start", "resume", or the `SeekPlan`.
+    pub how: &'static str,
+    /// Time of the first frame decoded after the jump (the keyframe).
+    pub first_decoded: Option<f64>,
+    /// Frames decoded before the target, thrown away.
+    pub discarded: u32,
+    /// Requests merged into this one while it waited.
+    pub coalesced: u32,
+    /// The demuxer's seek and decoder flush.
+    pub seek_ms: f64,
+    /// From the request to the target frame leaving the decoder.
+    pub ready_ms: f64,
+    pub read: crate::media::IoCount,
+}
+
+/// Per-jump bookkeeping in the decode thread.
+struct Catchup {
+    report: SeekReport,
+    requested: Instant,
+    io_before: crate::media::IoCount,
+}
+
+impl Catchup {
+    fn new(
+        generation: u64,
+        target: f64,
+        how: &'static str,
+        requested: Instant,
+        io: crate::media::IoCount,
+    ) -> Self {
+        Self {
+            report: SeekReport {
+                generation,
+                target,
+                how,
+                ..Default::default()
+            },
+            requested,
+            io_before: io,
+        }
+    }
+
+    /// The first frame at the target is on its way: log how it went.
+    fn finish(mut self, io: crate::media::IoCount, shared: &Mutex<Option<SeekReport>>) {
+        let r = &mut self.report;
+        r.ready_ms = self.requested.elapsed().as_secs_f64() * 1e3;
+        r.read = io.since(self.io_before);
+        eprintln!(
+            "Timing: seek to {:.1}s ({}): ready in {:.0} ms (seek {:.0} ms); keyframe {}, \
+             {} frames discarded, {} merged, read {}",
+            r.target,
+            r.how,
+            r.ready_ms,
+            r.seek_ms,
+            r.first_decoded.map_or("?".into(), |k| format!(
+                "{k:.2}s ({:.2}s before)",
+                r.target - k
+            )),
+            r.discarded,
+            r.coalesced,
+            r.read,
+        );
+        *shared.lock().expect("seek report") = Some(self.report);
+    }
+}
+
 struct DecodeThread {
     frames: mpsc::Receiver<Decoded>,
-    control: mpsc::Sender<(u64, f64)>,
+    control: mpsc::Sender<SeekRequest>,
+    /// The last finished seek (or start).
+    report: Arc<Mutex<Option<SeekReport>>>,
     requested: Arc<AtomicU64>,
     /// Which embedded subtitle track to decode (None: none).
     subtitle_track: mpsc::Sender<Option<usize>>,
@@ -246,13 +547,37 @@ fn spawn_decoder(
     let (audio_track, audio_changes) = mpsc::channel::<usize>();
     // A few frames of slack absorb decode jitter; more would only cost memory.
     let (tx, frames) = mpsc::sync_channel(4);
-    let (control, commands) = mpsc::channel::<(u64, f64)>();
+    let (control, commands) = mpsc::channel::<SeekRequest>();
     let requested = Arc::new(AtomicU64::new(0));
     let pending = requested.clone();
+    let report = Arc::new(Mutex::new(None));
+    let shared_report = report.clone();
     std::thread::Builder::new()
         .name("decode".into())
         .spawn(move || {
             let (mut generation, mut start) = (0u64, start);
+            let opened = decoder.requested_at;
+            let hardware = decoder.stats().hw_backend.is_some();
+            let mut catchup = Some(Catchup::new(
+                0,
+                start,
+                "start",
+                Instant::now(),
+                decoder.io(),
+            ));
+            // Continuing a video: jump there here, off the frame loop.
+            let mut resume = (start > 0.0).then(|| SeekRequest {
+                generation: 0,
+                target: start,
+                from: 0.0,
+                resume: true,
+                requested: Instant::now(),
+            });
+            // Time of the last frame decoded since the last jump.
+            let mut decoded: Option<f64> = None;
+            let mut preview_pending = false;
+            // Where the last jump went (the start, until the first frame, of a keyframe jump).
+            let mut aim = start;
             'decode: loop {
                 // Before seeks: the seek that follows a switch restarts the new track.
                 while let Ok(track) = audio_changes.try_recv() {
@@ -260,11 +585,70 @@ fn spawn_decoder(
                         eprintln!("Audio: can't decode track {track}");
                     }
                 }
-                while let Ok((g, t)) = commands.try_recv() {
-                    if let Err(e) = decoder.seek(t) {
-                        eprintln!("Seek to {t:.1}s failed: {e:#}");
+                // Only the latest of several queued jumps matters (D-pad held or mashed).
+                let mut latest = resume.take();
+                let mut merged = 0;
+                while let Ok(request) = commands.try_recv() {
+                    merged += latest.is_some() as u32;
+                    latest = Some(request);
+                }
+                if let Some(request) = latest {
+                    let plan = plan_seek(&SeekSituation {
+                        target: request.target,
+                        from: request.from,
+                        decoded,
+                        key_before: decoder.keyframe(request.target, false),
+                        key_after: decoder.keyframe(request.target, true),
+                        resume: request.resume,
+                        hardware,
+                    });
+                    let how = match plan {
+                        _ if request.resume => "resume",
+                        SeekPlan::Continue => "continue",
+                        SeekPlan::Exact => "exact",
+                        SeekPlan::Keyframe(_) => "keyframe",
+                    };
+                    let mut next = Catchup::new(
+                        request.generation,
+                        request.target,
+                        how,
+                        request.requested,
+                        decoder.io(),
+                    );
+                    // A jump still decoding towards its target was merged too.
+                    next.report.coalesced = merged
+                        + catchup
+                            .take()
+                            .filter(|c| c.report.generation != request.generation)
+                            .map_or(0, |c| c.report.coalesced + 1);
+                    let to = match plan {
+                        // Index times may be decode times (MP4), off from the
+                        // presentation times a seek takes by a frame or two:
+                        // aim between this keyframe and the next, and take
+                        // whatever frame comes first.
+                        SeekPlan::Keyframe(key) => decoder
+                            .keyframe(key + 1e-3, true)
+                            .map_or(key + 0.5, |next| (key + next) / 2.0),
+                        _ => request.target,
+                    };
+                    if plan != SeekPlan::Continue {
+                        let began = Instant::now();
+                        if let Err(e) = decoder.seek(to) {
+                            eprintln!("Seek to {to:.1}s failed: {e:#}");
+                        }
+                        next.report.seek_ms = began.elapsed().as_secs_f64() * 1e3;
+                        decoded = None;
                     }
-                    (generation, start) = (g, t);
+                    let keyframe = matches!(plan, SeekPlan::Keyframe(_));
+                    // Frames before the target are thrown away; those no
+                    // other frame needs are not even decoded.
+                    decoder.skip_nonref_until(if keyframe { 0.0 } else { to });
+                    preview_pending = plan == SeekPlan::Exact;
+                    catchup = Some(next);
+                    generation = request.generation;
+                    // A keyframe jump starts at the first frame, whatever its time.
+                    start = if keyframe { f64::NEG_INFINITY } else { to };
+                    aim = to;
                 }
                 while let Ok(track) = subtitle_changes.try_recv() {
                     embedded_cues.lock().expect("cues").clear();
@@ -275,11 +659,24 @@ fn spawn_decoder(
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let message = match decoder.next_frame() {
+                let mut message = match decoder.next_frame() {
                     Ok(Some(frame)) => Decoded::Frame(generation, frame),
                     Ok(None) => Decoded::End(generation),
                     Err(e) => Decoded::Failed(generation, format!("{e:#}")),
                 };
+                if let Decoded::Frame(_, frame) = &message {
+                    decoded = frame.pts().or(decoded);
+                    if let Some(c) = &mut catchup
+                        && c.report.first_decoded.is_none()
+                    {
+                        c.report.first_decoded = frame.pts();
+                    }
+                    if start == f64::NEG_INFINITY {
+                        start = frame.pts().map_or(aim, |t| t - 1e-3);
+                    }
+                } else if start == f64::NEG_INFINITY {
+                    start = aim; // ended or failed before any frame
+                }
                 let cues = decoder.take_subtitles();
                 if !cues.is_empty() {
                     let mut shared = embedded_cues.lock().expect("cues");
@@ -308,11 +705,24 @@ fn spawn_decoder(
                 }
                 // Seeking lands on the keyframe before `start`; decode through to it.
                 if let Decoded::Frame(_, frame) = &message
-                    && frame.pts().is_some_and(|t| t < start)
+                    && let Some(pts) = frame.pts().filter(|&t| t < start)
                 {
-                    continue;
+                    if let Some(c) = &mut catchup {
+                        c.report.discarded += 1;
+                    }
+                    // The keyframe, if the target is far: something to look at.
+                    if !std::mem::take(&mut preview_pending) || pts > start - PREVIEW_GAP {
+                        continue;
+                    }
+                    let Decoded::Frame(g, frame) = message else {
+                        unreachable!()
+                    };
+                    message = Decoded::Preview(g, frame);
+                } else {
+                    preview_pending = false;
                 }
-                let finished = !matches!(message, Decoded::Frame(..));
+                let preview = matches!(message, Decoded::Preview(..));
+                let finished = !matches!(message, Decoded::Frame(..) | Decoded::Preview(..));
                 let mut message = Some(message);
                 while let Some(m) = message.take() {
                     match tx.try_send(m) {
@@ -330,6 +740,17 @@ fn spawn_decoder(
                         Err(mpsc::TrySendError::Disconnected(_)) => return,
                     }
                 }
+                if !preview && let Some(c) = catchup.take() {
+                    if matches!(c.report.how, "start" | "resume")
+                        && let Some(at) = opened
+                    {
+                        eprintln!(
+                            "Timing: first frame ready {:.0} ms after the video was chosen",
+                            at.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    c.finish(decoder.io(), &shared_report);
+                }
                 if finished {
                     // Wait for a seek (e.g. back from the end) or shutdown.
                     while pending.load(Ordering::Relaxed) == generation {
@@ -345,6 +766,7 @@ fn spawn_decoder(
     DecodeThread {
         frames,
         control,
+        report,
         requested,
         subtitle_track,
         audio_track,
@@ -471,7 +893,8 @@ pub struct Playback {
 }
 
 impl Playback {
-    /// Starts decoding (and sound, when the file has audio) at `start` seconds.
+    /// Starts decoding (and sound, when the file has audio) at `start` seconds
+    /// (the keyframe at or before it).
     pub fn start(mut decoder: VideoDecoder, layout: Layout, start: f64, volume: f32) -> Self {
         // Embedded text subtitles; the file's default track is on from the start.
         let embedded: Vec<(usize, &crate::media::SubtitleTrackInfo)> = decoder
@@ -756,6 +1179,7 @@ impl Playback {
     /// Jumps to `seconds`; the current picture stays until the new one arrives.
     pub fn seek(&mut self, seconds: f64) {
         let target = seconds.clamp(0.0, (self.duration - 0.5).max(0.0));
+        let from = self.position();
         self.generation += 1;
         self.decode
             .requested
@@ -764,7 +1188,13 @@ impl Playback {
             audio.generation.store(self.generation, Ordering::Relaxed);
             *audio.clock.lock().expect("audio clock") = None;
         }
-        let _ = self.decode.control.send((self.generation, target));
+        let _ = self.decode.control.send(SeekRequest {
+            generation: self.generation,
+            target,
+            from,
+            resume: false,
+            requested: Instant::now(),
+        });
         self.next = None;
         self.ended = false;
         self.error = None;
@@ -786,6 +1216,14 @@ impl Playback {
             if self.next.is_none() && !self.ended {
                 match self.decode.frames.try_recv() {
                     Ok(Decoded::Frame(g, frame)) if g == self.generation => self.next = Some(frame),
+                    // Until the target frame starts the clock.
+                    Ok(Decoded::Preview(g, frame)) if g == self.generation => {
+                        if self.clock_start.is_none() {
+                            self.current = Some(frame);
+                            changed = true;
+                        }
+                        continue;
+                    }
                     Ok(Decoded::End(g)) if g == self.generation => self.ended = true,
                     Ok(Decoded::Failed(g, e)) if g == self.generation => {
                         eprintln!("Decoding stopped: {e}");
@@ -852,6 +1290,20 @@ impl Playback {
             error * 0.1
         };
         *start += (correction * 1e9) as i64;
+    }
+
+    /// How the last seek (or the start) went, once its frame was decoded.
+    pub fn seek_report(&self) -> Option<SeekReport> {
+        let report = self.decode.report.lock().expect("seek report");
+        report
+            .as_ref()
+            .filter(|r| r.generation == self.generation)
+            .cloned()
+    }
+
+    /// True once a frame from the latest seek (or the start) is on screen.
+    pub fn settled(&self) -> bool {
+        self.clock_start.is_some()
     }
 
     /// True once the stream ended and its last frame has been shown for a second.
