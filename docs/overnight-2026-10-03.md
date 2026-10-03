@@ -45,14 +45,14 @@ and send `grep -E "OpenXR|Input" ~/.local/state/just-video/log.txt`.
    at once while the decoder catches up.
 6. **D-pad (left controller).** While playing:
    - Left/right jump 5 s, or 1 min with the grip held.
-   - Up/down change the volume (default step 10 %; up to 150 % boosts quiet videos, with a limiter).
+   - Up/down change the headset's own volume (default step 10 %), as its volume buttons do (since the evening change below).
    - Holding a direction repeats it.
    - Every press shows a notice ("+5 s · 12:34", "Volume 60 %").
    - **If the D-pad does nothing:** run `grep -E "OpenXR|Input" ~/.local/state/just-video/log.txt`. It should say
      `enabled XR_VALVE_frame_controller_interaction` and `frame_controller: 20 bindings`. Until the afternoon
      fix below, the extension was never enabled, so the D-pad could not work.
 7. **Settings.** A gear row under "Add server" opens Settings. Its rows are jump length, long jump length,
-   volume step, volume, and continue where I left off. Click a row to step through its values; changes save
+   volume step, and continue where I left off (the volume row is gone since the evening change). Click a row to step through its values; changes save
    at once.
 
 ## Timing data (please grab after testing)
@@ -74,7 +74,6 @@ Still unknown until measured on the headset:
 
 - Rolling back to `just-video.prev` resets the new player settings (the old binary drops them on save).
 - The playability marks in a folder stop updating while a video plays, and resume afterwards.
-- Holding the D-pad while a video opens keeps repeating into the new video.
 - A long jump to near the end finishes the video.
 - Saving a server edit connects first, so you can't edit an offline server.
 - Minor: a bare IPv6 address like `fe80::1` is parsed wrongly. In subtitles, a stray `{` drops the rest of the line.
@@ -171,3 +170,50 @@ Still to look at:
   Resetting Just Video's per-app "throttling" setting in SteamVR would show it.
 - My browser-mode test (run without a terminal) rotated the app log, so the log from before
   00:40 is gone. `log.previous.txt` is now the 00:40 session.
+
+## Evening: jumps that stopped playback, headset volume, D-pad menus
+
+**Jumping forward quickly sometimes dropped back to the browser.** It wasn't the buffer. The
+headset's video driver (iris) sometimes refused to restart decoding at a jump. The kernel log
+says `current session not supported(-12)` on `STREAMON`, and the app logged `Decoding failed
+(FFmpeg error -12)`. That restart comes from our FFmpeg patch `0002` (the fast-seek flush).
+After one refusal, that decoder session stays broken: retrying gets "busy" (-16) every time.
+The player now replaces the video decoder, keeping the file, audio and subtitles, and jumps
+again. That takes 7–43 ms and stays on the hardware decoder. The log line is `Decoder failed (…);
+replaced in N ms (hardware), continuing at …`.
+
+- It shows on fast-decoding video (your 1080p H.264 episode) right after an exact jump, which
+  decodes ~30 frames as fast as it can. In 6K, short jumps land on keyframes, and 39 jumps
+  never triggered it.
+- To reproduce: `bench-seek <url> --from 5 --play 60 --hz 60 --jump-every 0.3`. On that
+  episode, before the fix, playback stopped within 3 jumps. After it: 119 jumps at one per
+  0.5 s, 40 refusals, all recovered, and playback never stopped.
+- 6K with forced failures: 19 replacements of 31–43 ms, all on hardware.
+
+**D-pad up/down set the headset's volume.** That's the SteamOS level its buttons set
+(`wpctl` on the default output, where the app's sound ends up), at most 100 %. Turning it up
+also unmutes. The app's own gain is always 100 % now; the old Settings "Volume" row and the
+saved value are gone. Untested with someone listening: check that the notice's percentage
+matches Steam's volume slider.
+
+**D-pad in menus.**
+- In the browser:
+  - Any D-pad press shows a focus (the same highlight as pointing).
+  - Up/down move row by row and scroll the list; left/right reach a row's buttons (Rename, Delete, lock…).
+  - Up from the first row reaches the breadcrumbs and header buttons.
+  - A (or the trigger) clicks; B goes back one level (it already did).
+- In dialogs, focus starts on the safe button (Cancel, never Delete).
+- On the keyboard, the D-pad moves between keys, and Shift keeps the focus in place.
+- Moving the pointer more than a little hands control back to it.
+- While playing, an open dialog (tracks, screen, image) takes the D-pad the same way, and B closes the
+  dialog instead of leaving the video. With no dialog open, the D-pad still jumps and sets the volume.
+- A sideways stick flick counts as left/right.
+- A direction held while a video opens or closes no longer repeats into the next screen.
+
+**To test:**
+1. In a folder, press down a few times, then right on a row with buttons, then A.
+2. Press B to go up, check the focus is on the folder you left, then A to go back in.
+3. Open "Add server": move around the keyboard and type with A.
+4. While playing, open the track dialog, pick a track with the D-pad and A, then B (the video should keep playing).
+5. Press D-pad up/down while playing and compare with Steam's volume.
+6. Jump forward quickly on the episode that used to stop.
