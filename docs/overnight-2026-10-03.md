@@ -70,3 +70,23 @@ Still unknown until measured on the headset:
 - A long jump to near the end finishes the video.
 - Saving a server edit connects first, so you can't edit an offline server.
 - Minor: a bare IPv6 address like `fe80::1` is parsed wrongly. In subtitles, a stray `{` drops the rest of the line.
+
+## Headset benchmark (morning, 6K60 HEVC VR180 over home Wi-Fi)
+
+Two 6K60 8-bit HEVC files from `smb://nick@n5.local/undupe/2026/09/` (hardware decoder),
+measured with `bench-seek`:
+- Opening: first frame in 0.2–0.6 s.
+- Every jump (±10 s, ±10 min, random): 0.06–0.6 s, usually 0.2–0.4 s.
+
+Three fixes found this way:
+1. **FFmpeg patch `0002`.** FFmpeg's V4L2 decoder had no flush, so after each jump ~20 frames
+   from the old place came out first. One of them was shown as the new picture, then playback
+   fast-forwarded until the sound caught up. The decoder now drops queued input on a jump, and
+   any old frames left are thrown away.
+2. **Jumps land on a keyframe up to 1 s before the target** instead of decoding to the exact frame.
+   These files have a keyframe every ~0.5 s.
+3. **Read-ahead keeps at most 6 reads in flight (was 32).** Reads can't be cancelled, so a jump waited
+   behind up to 32 MiB (≈1.5 s here). Throughput over this Wi-Fi is the same (~150 Mbit/s either way).
+
+The SMB path over the home Wi-Fi gives ~150 Mbit/s, although the link runs at ~1 Gbit/s. That's
+enough for these files (55 Mbit/s), but tight for 8K.
