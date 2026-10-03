@@ -35,7 +35,7 @@ The install now keeps the old binary as `~/Applications/JustVideo/just-video.pre
    Folder checks pause while a video plays.
 5. **Faster jumps.** Long jumps (≥ 1 min, seek bar) land on the nearest keyframe. Short jumps stay
    exact, and skip frames nothing depends on while catching up. With software decoding (10-bit), a
-   short jump may snap to a keyframe within half the jump (+10 s can land at +13 s). The keyframe is shown
+   short jump may snap to a keyframe within half the jump (+10 s can land anywhere from +5 s to +15 s). The keyframe is shown
    at once while the decoder catches up.
 6. **D-pad (left controller).** While playing:
    - Left/right jump 5 s, or 1 min with the grip held.
