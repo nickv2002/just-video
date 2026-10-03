@@ -90,3 +90,16 @@ Three fixes found this way:
 
 The SMB path over the home Wi-Fi gives ~150 Mbit/s, although the link runs at ~1 Gbit/s. That's
 enough for these files (55 Mbit/s), but tight for 8K.
+
+## Network (later the same morning)
+
+- **The ~150–200 Mbit/s ceiling is the Wi-Fi, not SMB.** Plain TCP from the server to the Frame gets about the same
+  (≈170–200 Mbit/s on one connection, 230–280 on two), although the radio link reports ~960 Mbit/s.
+  - The Frame is on 5 GHz channel 40, 80 MHz, at -39 dBm, with power saving off.
+  - Two NETGEAR mesh access points broadcast NickAir on the same channel. If the one near the Frame is a
+    satellite with a wireless link back to the router, that link is the likely limit.
+  - Neither the Frame's CPU (≈15 % of one core while reading) nor the server's disks (≈45 ms per cold
+    1 MiB read) is the limit.
+- **The playing video is now read over two SMB connections:** ~225 Mbit/s instead of ~175 (mean of 4
+  alternating runs). A stall on one connection no longer stops the video, and a read after a jump goes
+  to the less busy connection.
