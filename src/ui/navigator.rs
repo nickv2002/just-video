@@ -1,16 +1,18 @@
 //! Browser state: servers → shares → folders → videos. Talks to the
 //! [`Library`] workers and turns their results into a [`View`].
 //!
-//! Changing things is opt-in per server: its lock (on the server list)
-//! reveals Edit/Remove for the server and, inside it, Rename on every entry
-//! and a "Select" tool for deleting several entries at once.
+//! Each saved server can always be edited or removed from the server list.
+//! Changing files is opt-in per server: its lock (on the server list) allows,
+//! inside it, Rename on every entry and a "Select" tool for deleting several
+//! entries at once.
 
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, format_size};
 use super::form::{self, Field, Form, Key};
 use crate::config::{self, Server};
-use crate::library::{Library, Opened, Path, Request, Response};
+use crate::library::{Library, Opened, Path, Request, Response, file_key};
 use crate::playability::{Assessment, Verdict};
 use crate::smb::SmbUrl;
+use crate::vr::Layout;
 use std::collections::HashSet;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mkv", "mov", "webm", "avi", "ts", "m2ts"];
@@ -58,6 +60,8 @@ enum Item {
         name: String,
         size: u64,
         assessment: Option<Assessment>,
+        /// How it will be shown (once probed).
+        layout: Option<Layout>,
         broken: Option<String>,
     },
     /// A file that isn't a video: shown dimmed, can be renamed or deleted.
@@ -344,19 +348,14 @@ impl Navigator {
             .enumerate()
             .map(|(i, item)| {
                 let mut row = match item {
-                    Item::Server(s) => {
-                        let open = self.unlocked.contains(&s.url);
-                        Row {
-                            detail: s.url.clone(),
-                            lock: Some(open),
-                            actions: if open {
-                                vec![Action::Edit, Action::Remove]
-                            } else {
-                                Vec::new()
-                            },
-                            ..Row::new(Icon::Server, &s.name)
-                        }
-                    }
+                    Item::Server(s) => Row {
+                        detail: s.url.clone(),
+                        lock: Some(self.unlocked.contains(&s.url)),
+                        // Always offered: nothing on the server changes, and
+                        // Remove asks first.
+                        actions: vec![Action::Edit, Action::Remove],
+                        ..Row::new(Icon::Server, &s.name)
+                    },
                     Item::AddServer => Row {
                         detail: "A Windows PC, NAS or Samba server on your network".into(),
                         ..Row::new(Icon::Add, "Add server")
@@ -367,16 +366,23 @@ impl Navigator {
                         name,
                         size,
                         assessment,
+                        layout,
                         broken,
                     } => Row {
                         icon: match (assessment, broken) {
                             (_, Some(_)) => Icon::Broken,
-                            (Some(a), None) => Icon::Video(Some(a.verdict)),
-                            (None, None) => Icon::Video(None),
+                            (a, None) => {
+                                Icon::video(a.as_ref().map(|a| a.verdict), layout.as_ref())
+                            }
                         },
                         detail: match (assessment, broken) {
                             (_, Some(_)) => "Can't read this file".into(),
-                            (Some(a), None) => a.title.clone(),
+                            (Some(a), None) => {
+                                match layout.as_ref().and_then(Layout::short_label) {
+                                    Some(format) => format!("{format}  ·  {}", a.title),
+                                    None => a.title.clone(),
+                                }
+                            }
                             (None, None) => "Checking…".into(),
                         },
                         right: format_size(*size),
@@ -483,6 +489,7 @@ impl Navigator {
                                             name: e.name,
                                             size: e.size,
                                             assessment: None,
+                                            layout: None,
                                             broken: None,
                                         }
                                     }
@@ -522,13 +529,17 @@ impl Navigator {
                         if let Item::Video {
                             name: n,
                             assessment,
+                            layout,
                             broken,
                             ..
                         } = item
                             && *n == name
                         {
                             match &result {
-                                Ok(a) => *assessment = Some(a.clone()),
+                                Ok(p) => {
+                                    *assessment = Some(p.assessment.clone());
+                                    *layout = Some(p.layout);
+                                }
                                 Err(e) => *broken = Some(e.clone()),
                             }
                         }
@@ -567,7 +578,9 @@ impl Navigator {
                             if let Some(Purpose::EditServer(old)) = &self.purpose
                                 && *old != saved.url
                             {
-                                let _ = config::remove_server(old);
+                                if let Err(e) = config::move_server(old, &saved.url) {
+                                    eprintln!("Can't move the old server's settings: {e:#}");
+                                }
                                 if self.unlocked.remove(old) {
                                     self.unlocked.insert(saved.url.clone());
                                 }
@@ -742,8 +755,32 @@ impl Navigator {
             .playing
             .and_then(|i| self.items.get(i))
             .map(|item| item.trail_name().to_string());
+        self.reload_played_layout();
         self.restore_scroll();
         self.rebuild_rows();
+    }
+
+    /// The video that played may have had its format changed: mark it as saved.
+    fn reload_played_layout(&mut self) {
+        if let (
+            Some(i),
+            Location::Folder {
+                server,
+                share,
+                path,
+            },
+        ) = (self.playing, &self.location)
+            && let Some(Item::Video {
+                name,
+                layout: Some(layout),
+                ..
+            }) = self.items.get_mut(i)
+        {
+            let file: Path = path.iter().chain([&*name]).cloned().collect();
+            if let Ok(Some(saved)) = config::layout_override(&file_key(server, share, &file)) {
+                saved.apply(layout);
+            }
+        }
     }
 
     pub fn has_adjacent(&self, delta: isize) -> bool {
@@ -759,6 +796,7 @@ impl Navigator {
         self.selecting = None;
         self.view.dialog = None;
         self.view.form = None;
+        self.reload_played_layout();
         self.select(index);
         true
     }
@@ -881,7 +919,11 @@ impl Navigator {
             Some(domain) => format!("{domain};{}", u.user),
             None => u.user.clone(),
         });
-        let password_hint = if existing.is_some() { "unchanged" } else { "" };
+        let password_hint = if existing.is_some() {
+            "leave empty to keep the saved one"
+        } else {
+            ""
+        };
         let (title, submit) = match &existing {
             Some(s) => (format!("Edit {}", s.name), "Save"),
             None => ("Add server".to_string(), "Connect"),
@@ -1250,6 +1292,72 @@ mod tests {
     }
 
     #[test]
+    fn servers_can_be_edited_without_unlocking() {
+        let mut nav = Navigator::new(Library::start(None));
+        nav.items = vec![
+            Item::Server(Server {
+                name: "NAS".into(),
+                url: "smb://WORK;bob@nas:4455".into(),
+            }),
+            Item::AddServer,
+        ];
+        nav.rebuild_rows();
+        let row = &nav.view().rows[0];
+        assert_eq!(row.lock, Some(false));
+        assert_eq!(row.actions, vec![Action::Edit, Action::Remove]);
+
+        nav.click(Hit::RowAction(0, Action::Remove));
+        assert!(nav.dialog_open(), "removing asks first");
+        assert!(nav.back());
+
+        nav.click(Hit::RowAction(0, Action::Edit));
+        let form = nav.view().form.as_ref().expect("edit form");
+        assert_eq!(form.title, "Edit NAS");
+        let values: Vec<&str> = (0..4).map(|i| form.value(i)).collect();
+        assert_eq!(values, ["nas:4455", "WORK;bob", "", "NAS"]);
+        assert!(
+            matches!(&nav.purpose, Some(Purpose::EditServer(url)) if url == "smb://WORK;bob@nas:4455")
+        );
+    }
+
+    #[test]
+    fn videos_are_marked_by_format() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+        };
+        nav.show_entries_for_test(server, &[]);
+        let a = crate::playability::assess(crate::playability::Platform::SteamFrame, None);
+        nav.items = ["film.mkv", "film_sbs.mkv", "trip_180_LR.mp4", "new_360.mp4"]
+            .into_iter()
+            .map(|name| Item::Video {
+                name: name.into(),
+                size: 1,
+                assessment: Some(a.clone()),
+                layout: Some(crate::vr::detect(name, None)),
+                broken: None,
+            })
+            .collect();
+        if let Some(Item::Video {
+            assessment, layout, ..
+        }) = nav.items.last_mut()
+        {
+            (*assessment, *layout) = (None, None); // not probed yet
+        }
+        nav.rebuild_rows();
+        let rows = &nav.view().rows;
+        let v = Some(a.verdict);
+        assert_eq!(rows[0].icon, Icon::Video(v));
+        assert_eq!(rows[0].detail, a.title);
+        assert_eq!(rows[1].icon, Icon::Video3d(v));
+        assert_eq!(rows[1].detail, format!("3D  ·  {}", a.title));
+        assert_eq!(rows[2].icon, Icon::VideoVr(v));
+        assert_eq!(rows[2].detail, format!("VR180 3D  ·  {}", a.title));
+        assert_eq!(rows[3].icon, Icon::Video(None));
+    }
+
+    #[test]
     fn going_up_returns_to_the_folder_left() {
         let mut nav = Navigator::new(Library::start(None));
         let server = Server {
@@ -1285,6 +1393,7 @@ mod tests {
             name: name.into(),
             size: 1,
             assessment: None,
+            layout: None,
             broken: broken.then(|| "bad".to_string()),
         };
         let file = Item::File {

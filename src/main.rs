@@ -838,9 +838,9 @@ fn main() -> anyhow::Result<()> {
                         ..row(Icon::File, "notes.txt", "", "2 KB")
                     },
                     row(
-                        Icon::Video(Some(Verdict::Hardware)),
+                        Icon::VideoVr(Some(Verdict::Hardware)),
                         "旅行_180_LR.mp4",
-                        "Plays with hardware decoding (5.7K 30 fps 8-bit HEVC)",
+                        "VR180 3D  ·  Plays with hardware decoding (5.7K 30 fps 8-bit HEVC)",
                         "3.3 GB",
                     ),
                 ],
@@ -849,6 +849,87 @@ fn main() -> anyhow::Result<()> {
             just_video::ui::save_png(
                 &render(&folder, &mut fonts, Some((700.0, 400.0)), true),
                 &dir.join("folder.png"),
+            )?;
+            // Flat, 3D and VR videos at each verdict, marked as the browser marks them.
+            let video = |name: &str, verdict: Option<Verdict>, title: &str, size: &str| {
+                let layout = just_video::vr::detect(name, None);
+                let detail = match (verdict, layout.short_label()) {
+                    (None, _) => "Checking…".to_string(),
+                    (Some(_), Some(format)) => format!("{format}  ·  {title}"),
+                    (Some(_), None) => title.to_string(),
+                };
+                // The layout arrives with the probe, like the verdict.
+                let icon = Icon::video(verdict, verdict.map(|_| &layout));
+                Row {
+                    detail,
+                    right: size.into(),
+                    ..Row::new(icon, name)
+                }
+            };
+            let videos = View {
+                crumbs: crumbs(&["Just Video", "NAS", "media", "Mixed"]),
+                rows: vec![
+                    video(
+                        "Movie.2024.2160p.mkv",
+                        Some(Verdict::Hardware),
+                        "Plays with hardware decoding (4K 24 fps 8-bit HEVC)",
+                        "18.3 GB",
+                    ),
+                    video(
+                        "Avatar.2009.3D.HSBS.mkv",
+                        Some(Verdict::Hardware),
+                        "Plays with hardware decoding (1080p 24 fps 8-bit H.264)",
+                        "9.4 GB",
+                    ),
+                    video(
+                        "Trip_180_LR.mp4",
+                        Some(Verdict::Hardware),
+                        "Plays with hardware decoding (5.7K 30 fps 8-bit HEVC)",
+                        "3.3 GB",
+                    ),
+                    video(
+                        "dive_360_TB.mkv",
+                        Some(Verdict::Software),
+                        "Plays with CPU decoding (6K 30 fps 10-bit HEVC)",
+                        "7.0 GB",
+                    ),
+                    video(
+                        "walk_360.mp4",
+                        Some(Verdict::SoftwareMarginal),
+                        "May stutter (8K 30 fps 10-bit HEVC)",
+                        "4.1 GB",
+                    ),
+                    video(
+                        "concert_8k_180_sbs.mp4",
+                        Some(Verdict::Unplayable),
+                        "Can't play smoothly on Steam Frame (8K 60 fps 10-bit HEVC)",
+                        "12.6 GB",
+                    ),
+                    video(
+                        "scene_FISHEYE190_LR.mp4",
+                        Some(Verdict::Hardware),
+                        "Plays with hardware decoding (4K 60 fps 8-bit HEVC)",
+                        "2.2 GB",
+                    ),
+                    video(
+                        "Concert_film_TB.mkv",
+                        Some(Verdict::Software),
+                        "Plays with CPU decoding (1080p 60 fps 10-bit HEVC)",
+                        "2.9 GB",
+                    ),
+                    video(
+                        "A very long name for a VR video shot on the beach at sunset_180_LR.mp4",
+                        Some(Verdict::Hardware),
+                        "Plays with hardware decoding (5.7K 60 fps 8-bit HEVC)",
+                        "6.8 GB",
+                    ),
+                    video("short_clip.mp4", None, "", "88.4 MB"),
+                ],
+                ..Default::default()
+            };
+            just_video::ui::save_png(
+                &render(&videos, &mut fonts, Some((700.0, 310.0)), true),
+                &dir.join("videos.png"),
             )?;
             let servers = View {
                 crumbs: crumbs(&["Just Video"]),
@@ -865,6 +946,10 @@ fn main() -> anyhow::Result<()> {
                     Row {
                         detail: "smb://user@10.0.0.2".into(),
                         lock: Some(false),
+                        actions: vec![
+                            just_video::ui::browser::Action::Edit,
+                            just_video::ui::browser::Action::Remove,
+                        ],
                         ..Row::new(Icon::Server, "PC")
                     },
                     Row {
@@ -906,6 +991,26 @@ fn main() -> anyhow::Result<()> {
             just_video::ui::save_png(
                 &render(&adding, &mut fonts, Some((700.0, 700.0)), true),
                 &dir.join("form.png"),
+            )?;
+            // Editing a saved server: an empty password keeps the saved one.
+            let mut editing_server = servers.clone();
+            editing_server.form = Some(Form::new(
+                "Edit NAS",
+                ["Address", "User", "Password", "Name"]
+                    .iter()
+                    .zip(["192.168.1.10:445", "WORKGROUP;user", "", "NAS"])
+                    .map(|(label, value)| Field {
+                        label: label.to_string(),
+                        value: value.into(),
+                        secret: *label == "Password",
+                        placeholder: "leave empty to keep the saved one".into(),
+                    })
+                    .collect(),
+                "Save",
+            ));
+            just_video::ui::save_png(
+                &render(&editing_server, &mut fonts, None, false),
+                &dir.join("form-edit.png"),
             )?;
             just_video::ui::save_png(
                 &render(&servers, &mut fonts, None, false),

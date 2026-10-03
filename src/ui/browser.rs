@@ -4,6 +4,7 @@
 use super::canvas::{Canvas, Fonts, Rgb};
 use super::form::{self, Form};
 use crate::playability::Verdict;
+use crate::vr::{Layout, Projection, Stereo};
 
 pub const WIDTH: u32 = 1600;
 pub const HEIGHT: u32 = 1000;
@@ -47,11 +48,26 @@ pub enum Icon {
     Folder,
     /// A video; `None` while its playability is still being checked.
     Video(Option<Verdict>),
+    /// A 3D video for a flat screen (side by side or top/bottom): glasses.
+    Video3d(Option<Verdict>),
+    /// A VR180, VR360 or fisheye video: a headset.
+    VideoVr(Option<Verdict>),
     /// A file that could not be read.
     Broken,
     /// A file that isn't a video.
     File,
     Add,
+}
+
+impl Icon {
+    /// A video's mark: its shape says flat, 3D or VR, its colour how well it plays.
+    pub fn video(verdict: Option<Verdict>, layout: Option<&Layout>) -> Icon {
+        match layout {
+            Some(l) if l.projection != Projection::Flat => Icon::VideoVr(verdict),
+            Some(l) if l.stereo != Stereo::Mono => Icon::Video3d(verdict),
+            _ => Icon::Video(verdict),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,7 +390,8 @@ pub fn hit(view: &View, fonts: &mut Fonts, x: f32, y: f32) -> Hit {
     Hit::Row(i)
 }
 
-fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
+/// `bg` is the row behind the icon, for cut-outs.
+fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32, bg: Rgb) {
     match icon {
         Icon::Server => {
             canvas.rect(cx - 22.0, cy - 20.0, 44.0, 16.0, 4.0, ACCENT);
@@ -391,15 +408,23 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
             canvas.rect(cx - 24.0, cy - 18.0, 20.0, 10.0, 3.0, color);
             canvas.rect(cx - 24.0, cy - 12.0, 48.0, 32.0, 4.0, color);
         }
-        Icon::Video(verdict) => {
-            let color = match verdict {
-                Some(Verdict::Hardware) => GREEN,
-                Some(Verdict::Software) => YELLOW,
-                Some(Verdict::SoftwareMarginal) => ORANGE,
-                Some(Verdict::Unplayable) => RED,
-                None => GREY,
-            };
-            canvas.circle(cx, cy, 16.0, color);
+        Icon::Video(verdict) => canvas.circle(cx, cy, 16.0, verdict_color(*verdict)),
+        Icon::Video3d(verdict) => {
+            // Glasses: two lenses on a bar, with short arms.
+            let color = verdict_color(*verdict);
+            canvas.rect(cx - 26.0, cy - 10.0, 52.0, 5.0, 2.0, color);
+            canvas.rect(cx - 24.0, cy - 10.0, 21.0, 19.0, 6.0, color);
+            canvas.rect(cx + 3.0, cy - 10.0, 21.0, 19.0, 6.0, color);
+        }
+        Icon::VideoVr(verdict) => {
+            // A headset from the front: visor with two lenses and a nose gap,
+            // and the strap at the sides.
+            let color = verdict_color(*verdict);
+            canvas.rect(cx - 29.0, cy - 6.0, 58.0, 8.0, 3.0, color);
+            canvas.rect(cx - 24.0, cy - 17.0, 48.0, 33.0, 10.0, color);
+            canvas.circle(cx - 11.0, cy - 2.0, 7.0, bg);
+            canvas.circle(cx + 11.0, cy - 2.0, 7.0, bg);
+            canvas.circle(cx, cy + 17.0, 7.0, bg);
         }
         Icon::Broken => {
             canvas.circle(cx, cy, 16.0, RED);
@@ -417,6 +442,17 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
             canvas.rect(cx - 3.0, cy - 18.0, 6.0, 36.0, 3.0, ACCENT);
             canvas.rect(cx - 18.0, cy - 3.0, 36.0, 6.0, 3.0, ACCENT);
         }
+    }
+}
+
+/// How well a video plays; grey while that is being checked.
+fn verdict_color(verdict: Option<Verdict>) -> Rgb {
+    match verdict {
+        Some(Verdict::Hardware) => GREEN,
+        Some(Verdict::Software) => YELLOW,
+        Some(Verdict::SoftwareMarginal) => ORANGE,
+        Some(Verdict::Unplayable) => RED,
+        None => GREY,
     }
 }
 
@@ -526,11 +562,12 @@ pub fn render(
             if row.outlined {
                 canvas.rect(rx - 3.0, ry - 3.0, rw + 6.0, rh + 6.0, 17.0, ACCENT);
             }
-            canvas.rect(rx, ry, rw, rh, 14.0, if hovered { HOVER } else { ROW_BG });
+            let bg = if hovered { HOVER } else { ROW_BG };
+            canvas.rect(rx, ry, rw, rh, 14.0, bg);
             let (icon_x, icon_y) = (PAD + 48.0, ry - 4.0 + ROW / 2.0);
             match row.checked {
                 Some(checked) => draw_checkbox(&mut canvas, icon_x, icon_y, checked),
-                None => draw_icon(&mut canvas, &row.icon, icon_x, icon_y),
+                None => draw_icon(&mut canvas, &row.icon, icon_x, icon_y, bg),
             }
             let mut right_edge = rx + rw - 24.0;
             if let Some(unlocked) = row.lock {
@@ -577,15 +614,14 @@ pub fn render(
                 } else {
                     let label = action.label();
                     let lw = fonts.measure(label, 30.0);
-                    fonts.draw(
-                        &mut canvas,
-                        label,
-                        ax + (aw - lw) / 2.0,
-                        ay + ah / 2.0 + 11.0,
-                        30.0,
-                        TEXT,
-                        aw,
-                    );
+                    // Edit: a pencil before the word, like Rename's.
+                    let pencil_w = if *action == Action::Edit { 50.0 } else { 0.0 };
+                    let lx = ax + (aw - lw - pencil_w) / 2.0 + pencil_w;
+                    if pencil_w > 0.0 {
+                        let pencil_x = lx - pencil_w / 2.0 - 6.0;
+                        draw_pencil(&mut canvas, pencil_x, ay + ah / 2.0, TEXT);
+                    }
+                    fonts.draw(&mut canvas, label, lx, ay + ah / 2.0 + 11.0, 30.0, TEXT, aw);
                 }
                 if k == 0 {
                     right_edge = ax - 16.0;
@@ -888,7 +924,8 @@ mod tests {
     fn locks_actions_and_tools() {
         let mut view = view();
         let mut fonts = Fonts::load().expect("fonts");
-        view.rows[2].lock = Some(true);
+        // A server row: Edit and Remove beside its lock, locked or not.
+        view.rows[2].lock = Some(false);
         view.rows[2].actions = vec![Action::Edit, Action::Remove];
         let (x, y, w, h) = lock_rect(&view, 2);
         assert_eq!(
