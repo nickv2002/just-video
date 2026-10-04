@@ -409,3 +409,12 @@ the first generation; fixed.) First 5 s after opening:
 Playing with a jump every 1.5 s (6K): 799 pictures shown vs 558, 56 ticks behind vs 166, waited for
 sound at most 17 ms per 5 s vs 111. 8K and 1080p: as good or better. The log's "nearly dry" no
 longer counts the first writes into the empty buffer after a start.
+
+**Also:**
+- **A failed jump now counts for the whole app session**, not just the video: Steam's decoder
+  session lasts until a restart, so every video's first jump repeated the failing flush (one
+  "Decoder failed" and a slower first jump each). Now only the first jump after starting the app does.
+- **The NAS name sometimes doesn't resolve on the headset** ("Invalid address: n5.local", 1 run in 6):
+  opening or listing failed outright. The SMB library now tries the name three times (0.1 s,
+  0.2 s apart), then uses the address that last worked in this run. Covered by a unit test; not
+  seen to happen again in 6 runs.
