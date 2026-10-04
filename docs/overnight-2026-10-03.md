@@ -287,3 +287,76 @@ than between binaries. No measurable gain, so not kept.
 ```sh
 scripts/frame-ssh.sh 'grep -E "Timing: (folder|open)|warm|Probe cache|Library" ~/.local/state/just-video/log.txt'
 ```
+
+## Evening: sound that stuttered, and 8K that stuttered
+
+**Cause.** In the session where you heard it, every hardware decoder open failed
+(`hevc_v4l2m2m … VIDIOC_REQBUFS failed: Cannot allocate memory`), so 6K and 8K were decoded on the
+CPU. The CPU can't decode 8K in real time, and the sound is decoded by the same thread, along with
+the picture. So the sound ran out too (about 15 % short), and the picture drifted 100–360 ms ahead
+of it. After a reboot the hardware decoder opened every time (also 5 × 8K back to back). With it,
+6K, 8K and 1080p all play with 0 skipped pictures and the sound never short. 8K on hardware doesn't
+stutter, but has less headroom: up to 9–14 ms of the 13.9 ms frame at 72 Hz, mostly copying the picture.
+Probably today's ~100 benchmark decoder sessions left the driver unable to allocate; not proven.
+
+**Changes:**
+1. **The sound is read up to 1 s ahead of the picture.** The decoder keeps a queue of video packets
+   and decodes sound as soon as it is read. Right after a jump, the queue waits until the first picture
+   is out, so jumps and opening stay as fast. The queue then grows by up to 3 packets per picture.
+2. **CPU decoding that falls behind decodes less.** It skips frames nothing refers to. More than 1 s
+   behind, it decodes keyframes only until it catches up; with keyframes seconds apart, the picture
+   then freezes for a moment. Hardware decoding is unaffected.
+3. **A failed hardware decoder open is retried twice** (after 0.25 s and 0.5 s) before using the CPU.
+   If it still fails, the video shows "Hardware video decoder unavailable: playing on the CPU. If this
+   keeps happening, restart the headset." The retry is untested: the failure didn't come back.
+4. **New log lines every 5 s while playing:** `Timing: audio …` (how full the sound buffer was, and
+   time spent waiting for sound), `Timing: sync picture ahead of sound by …`, and `Playback: decoding fell behind …`.
+
+**8K on the CPU** (the failure case, measured headless with `--hw none`), per 5 s:
+
+| | Sound arrived | Waited for sound | Picture vs sound |
+|---|---|---|---|
+| Before | ~85 % | ~400 ms | 100–140 ms ahead (up to 360) |
+| After | 100 % (never below 59 ms queued) | 0 ms | within ±13 ms |
+
+The picture itself still lags up to ~0.8 s on the CPU and skips about half its frames; it can't keep up.
+
+**Jumps (6K, `bench-seek`, 5 alternating pairs):** median ready 140 ms vs 122 ms installed. That's within
+the Wi-Fi spread (122–313 vs 112–152), but may be a small real cost.
+
+**To test:** play an episode and a VR video for a few minutes and listen. Then:
+`scripts/frame-ssh.sh 'grep -E "Timing: (audio|sync)|Playback:|CPU|REQBUFS" ~/.local/state/just-video/log.txt'`
+
+## Late evening: jumps that never showed, and resuming too early
+
+Three problems found above, all also in the installed build:
+
+1. **H.264 on the hardware decoder never showed a picture after a jump.** After a jump flushes it,
+   the iris H.264 decoder returns one empty picture and then never takes another packet, so the
+   decoder thread waits forever (HEVC flushes fine). Playing straight through, or opening at a
+   time, works. Now a jump in H.264 on the hardware opens a new decoder (14–26 ms at 1080p),
+   like opening the video at that time. 1080p `bench-seek`: every jump shown in 46–294 ms
+   (before: none).
+2. **"Almost nothing shown at a jump every 0.3 s"** was problem 1 on the 1080p file, and on 6K the
+   driver failing at jumps (below). 1080p, a jump every 0.3 s for 20 s: 484 pictures shown over
+   66 jumps (before: about 10 in 60 s).
+3. **Resuming 8K started up to 10 s early** (keyframes 10 s apart; it always took the keyframe
+   before). Now resuming takes a keyframe up to 2 s before the target, else one up to 3 s after
+   it (the target is already 3 s before where you stopped, so never past that). Else, on the
+   hardware and with the keyframe before at most 4 s back, it decodes on to the target,
+   showing the keyframe meanwhile. Otherwise it still starts at the keyframe before: 8K
+   decodes at only ~1.8× real time, so a 5 s gap is a ~3 s still picture. 8K resumed at
+   839.4 s: starts at 840.8 s in 0.38 s (before: 830.8 s in 0.5 s).
+
+**The hardware decoder failing at jumps came back** an hour after the reboot: every jump in 6K
+failed ("busy", then "out of memory") in every build, and playback stopped. Probably H.264
+sessions that hung (problem 1) and were killed while debugging; not proven. Steam's web
+helper also keeps the decoder device open. Opening videos still worked. Now the last of the
+three restarts at a jump goes to the CPU instead of stopping, with the "playing on the CPU"
+notice. 6K in that state: every jump shown in 0.3–1.1 s on the CPU.
+
+**`bench-seek` now fails** (exit code 3) when a jump never shows a picture or playback stops,
+so it works as a check on the headset.
+
+**Not verified:** 6K jumps on the hardware with this build. The driver was failing when it was
+measured; that needs a headset restart.
