@@ -348,15 +348,21 @@ Three problems found above, all also in the installed build:
    decodes at only ~1.8× real time, so a 5 s gap is a ~3 s still picture. 8K resumed at
    839.4 s: starts at 840.8 s in 0.38 s (before: 830.8 s in 0.5 s).
 
-**The hardware decoder failing at jumps came back** an hour after the reboot: every jump in 6K
-failed ("busy", then "out of memory") in every build, and playback stopped. Probably H.264
-sessions that hung (problem 1) and were killed while debugging; not proven. Steam's web
-helper also keeps the decoder device open. Opening videos still worked. Now the last of the
-three restarts at a jump goes to the CPU instead of stopping, with the "playing on the CPU"
-notice. 6K in that state: every jump shown in 0.3–1.1 s on the CPU.
+**The hardware decoder failing at jumps (6K and 8K).** Every jump in 6K or 8K fails on the
+hardware ("busy", then "out of memory"), in every build, including the one from before this
+work. Opening a video at any time still works. It is not worn-out driver state, as first
+guessed: it fails right after a restart too. Same kernel, SteamOS and Steam builds on every
+boot. 6K jumps worked at 16:33 on Oct 3 and failed from 17:10, right after a reboot, on every
+boot since. Likely cause, not proven: Steam's web helper (its browser zygote) holds a hardware
+decoder session with 8 buffers from boot. A jump restarts our decoder, which needs more
+than the driver has left. Opening a new decoder at each jump fails the same way: the old
+one stays alive while its pictures are still on screen or queued. Now the last of the three
+restarts at a jump goes to the CPU instead of stopping, with the "playing on the CPU" notice.
+6K in that state: every jump shown in 0.3–1.1 s on the CPU, but 8K then plays on the CPU and stutters.
 
-**`bench-seek` now fails** (exit code 3) when a jump never shows a picture or playback stops,
-so it works as a check on the headset.
+**`bench-seek` now fails** (exit code 3) when a jump never shows a picture, playback stops, or
+the hardware decoder fails at a jump and the CPU takes over, so it works as a check on the headset.
 
-**Not verified:** 6K jumps on the hardware with this build. The driver was failing when it was
-measured; that needs a headset restart.
+**Open:** 6K and 8K jumps on the hardware. Next steps: restart Steam's web helper to test the
+cause, or make the old decoder close before a new one opens (the renderer would have to let go
+of the picture on screen).
