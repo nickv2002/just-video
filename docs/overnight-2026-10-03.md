@@ -554,8 +554,7 @@ Steam session; 8K never does.
 - 1080p H.264 (replaced at every jump): replacement 33 ms vs 42 ms; ready median unchanged (126–130 ms).
 - **6K not measured yet:** Steam holds two sessions since its blocked suspend, so 6K doesn't qualify
   and ran as before (no failures).
-- **Unverified:** sessions are counted as open files on the device. If Steam holds two files per
-  session, 6K never qualifies. Check how many it holds while 8K still opens on the hardware.
+- Sessions are counted as open files on the device: one file per session (see after the reboot below).
 - **Fixed regression:** counting reads ~4000 open files (8.5 ms in Python on the headset), and it ran on
   every jump: 6K decoder time per jump 168–172 ms vs 146–157 before. The count is now kept and
   refreshed on a thread every 5 s or more, starting when a hardware decoder opens: 155–158 ms.
@@ -570,5 +569,13 @@ shows it as "copy ahead", outside "loop work".
 - Measured in the real OpenXR loop (`JUST_VIDEO_RENDER_UNSEEN=1`, nobody wearing the headset, 72 Hz):
   - 6K: the copy within the frame went from 1.9/3.5–4.5 ms (mean/max) to 0.0/0.0; every picture was copied ahead.
   - 1080p30: the same, with loop work max 1.0 ms. 0 periods missed, before and after.
-- **8K not measured yet** (Steam's second session keeps it on the CPU). It is the case this is for:
-  its worst copies took more than a whole 72 Hz frame.
+- 8K, measured after a reboot (two alternating pairs, 40 s each, 72 Hz): after the first 5 s, loop work
+  against the deadline max **0.7–1.1 ms vs 4.7–6.2 ms**. The in-frame copy is 0.0/0.0 vs 2.5/4.5. The copy
+  ahead takes 3.4 ms mean (6.4 max), between frames. 0 periods missed both ways.
+
+**After the reboot (Steam awake, its web helper holding one decoder session, one open file):**
+6K jumps every 1.5 s: **no flush failed** (0 of 40 jumps; before the reboot nearly every one did).
+Ready median 142–156 ms, of which the decoder ~31 ms; the rest is the network. So no decoder
+was replaced, and the background free didn't come into play. One open file per session: before
+the reboot two files went with 8K refused, as for two sessions. Why the one session no longer
+makes flushes fail isn't known; perhaps it isn't streaming.
