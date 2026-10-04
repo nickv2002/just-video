@@ -363,6 +363,9 @@ restarts at a jump goes to the CPU instead of stopping, with the "playing on the
 **`bench-seek` now fails** (exit code 3) when a jump never shows a picture, playback stops, or
 the hardware decoder fails at a jump and the CPU takes over, so it works as a check on the headset.
 
-**Open:** 6K and 8K jumps on the hardware. Next steps: restart Steam's web helper to test the
-cause, or make the old decoder close before a new one opens (the renderer would have to let go
+**Cause confirmed (Oct 4):** with Steam's web helper process holding the decoder stopped (Steam
+restarted it without opening the decoder again), 8K jumps had no failures and stayed on the
+hardware. 6K had no failures in one run, and one failure that recovered on the hardware in
+another. Steam may open its session again (at the latest on the next boot). The fix in the
+player: close the old decoder before a new one opens at a jump (the renderer would have to let go
 of the picture on screen).
