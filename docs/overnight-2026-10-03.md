@@ -478,7 +478,7 @@ flushes each, all replaced on the hardware, never the CPU), 6K, 8K and 1080p H.2
 - **`scripts/frame-keep-awake.sh [HOURS]`** stops Steam suspending the headset during tests (it
   sleeps after 1 h without input, even on the charger, as it did at 02:24). It holds a logind
   inhibitor through the user's service manager (polkit refuses it to an SSH session).
-  `stop` ends it. Not yet seen to stop a suspend.
+  `stop` ends it. Seen working at 10:54: "Access denied due to active block inhibitor" (see below).
 - Test runs now mute the headset first (`wpctl set-mute`), so playback tests make no sound.
 
 ### Oct 4 late morning: back to the hardware decoder, and the picture stuck at 0 s
@@ -517,3 +517,29 @@ the speed). 6K worst copy 11–13 ms vs 9–10 ms; means equal. The worst copies
 
 **Not measured: the real frame loop at 8K.** With nobody wearing the headset, the OpenXR session
 stays SYNCHRONIZED and never draws.
+
+**Why flushes fail when Steam holds a decoder session (read from the driver's code).** The
+headset's `iris.ko` was disassembled (`check_session_supported`, `check_core_mbps_mbpf`,
+`iris_update_input_rate`). When a session starts streaming, the driver adds up the load of all
+open sessions. Through a bug, it counts every session as the one starting: its macroblocks per
+frame and its frame rate. The limits are 278,528 macroblocks per frame (two 8K pictures) and
+7,833,600 per second (8K at 68 fps). The frame rate is how fast input buffers were queued, over
+the last 30 (`ktime_get`, not their time stamps), and at least 30. So:
+- A new session counts at 30 fps: 6K or 8K with one other session passes (8K: 2 × 115,200 × 30 = 6.9 M).
+- A flushed session that played 60 fps content counts at 60: 6K with one other session is
+  2 × 73,728 × 60 = 8.8 M, refused. That's every jump while Steam's web helper holds a session.
+- With two other sessions, 8K is 3 × 115,200 macroblocks per frame and never opens.
+
+Tried and not kept: making time stamps 4× as far apart (`pkt_timebase`), hoping to lower the
+measured rate. No change (25 of 27 flushes still failed), as the rate comes from queueing times. The only lever would be
+queueing input slower, i.e. decoding slower. So replacing the decoder at a jump stays.
+
+**The keep-awake inhibitor works, with a catch.** At 10:54 (an hour after the headset was
+switched on), Steam tried to suspend and logind refused: "Access denied due to active block
+inhibitor". The headset stayed up. But Steam stays in its sleep power state until the headset is
+used. Meanwhile:
+- Its web helper holds a second decoder session, from 4 s after the attempt, so 8K won't open on
+  the hardware.
+- A VR app's session stays SYNCHRONIZED and never draws.
+A virtual mouse (`/dev/uinput`, 1 px right and back) doesn't count as use. 6K and 1080p tests over
+SSH are unaffected.
