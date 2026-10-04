@@ -480,3 +480,40 @@ flushes each, all replaced on the hardware, never the CPU), 6K, 8K and 1080p H.2
   inhibitor through the user's service manager (polkit refuses it to an SSH session).
   `stop` ends it. Not yet seen to stop a suspend.
 - Test runs now mute the headset first (`wpctl set-mute`), so playback tests make no sound.
+
+### Oct 4 late morning: back to the hardware decoder, and the picture stuck at 0 s
+
+**A video on the CPU because the hardware decoder failed now moves back to it.** Until now a
+video that fell back to the CPU (its open refused, a jump that failed three times, or the
+firmware crashing and restarting) stayed there until closed, and 8K on the CPU shows about
+half its frames. Now the player tries the hardware again 2 s later, then 4, 8, 16 and every 30 s.
+It only tries while the firmware isn't down (`core_state` isn't `CORE_DEINIT`), and at most
+3 times per video. A failed try costs 1–4 ms and the CPU decoder carries on. When the new session
+opens, the switch happens at the next keyframe within 0.2 s of the position (or after waiting 15 s),
+so nothing is decoded twice. It also happens at a jump. Shown as "Hardware video decoder back".
+- Test: a second process holds the hardware decoder for 20–25 s while `bench-seek --play` runs.
+  8K: `back on the hardware in 111 ms` at a keyframe. The sound never paused and picture-sound
+  sync stayed within ±12 ms. 32 late frames, once. 6K: 6 skipped frames over the whole 60 s run.
+  At a jump: `back on the hardware in 71 ms, at a jump`, then every jump on the hardware.
+- First version (not kept): it went back at the current position, decoding from the keyframe
+  before it. That was up to 10 s of 8K, a ~3.4 s pause with no sound.
+- **Sound sent twice is now skipped.** When a decoder is replaced in place (here, or after a failed
+  jump), the decoder reads again up to 1 s of sound that was already queued, and it played twice.
+  The decode thread now remembers how far the sound was sent for the current jump.
+
+**The picture that stood still after a jump wasn't stamped 0 s.** The log of that run shows frames
+at 0.03–0.08 s, the start of the video, coming out after the first jump (to 300 s). They were frames
+left over from before the jump, which the stale-frame check let through. The floor from last night
+(drop frames from more than 1 s before the jump's keyframe) caught them. Patch 0003's warning never
+appeared in any run, so it fixed nothing seen here; it stays as a guard. The stale check no longer
+switches itself off at a frame without a time. 5 runs of 6K with a jump every 1.5 s (135 jumps,
+~126 decoder replacements): no frame from before a jump shown.
+
+**Steam's web helper held two decoder sessions** from about 10:54 (one before). With them, 8K
+won't open on the hardware at all ("current session not supported" at open). 6K still opens.
+
+**Tried and not kept: the copy shared out in 32 parts** (two of the eight cores run at a quarter of
+the speed). 6K worst copy 11–13 ms vs 9–10 ms; means equal. The worst copies have another cause.
+
+**Not measured: the real frame loop at 8K.** With nobody wearing the headset, the OpenXR session
+stays SYNCHRONIZED and never draws.
