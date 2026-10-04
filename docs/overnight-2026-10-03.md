@@ -380,5 +380,11 @@ running (a 1080p decode in the background, standing in for Steam's):
 | Hardware failures | 3, then the CPU for the rest | 1 (the first flush), then hardware |
 | Jumps shown | 0.4–0.9 s (CPU) | 0.15–0.7 s (once 1.4 s) |
 
-8K: the same, all jumps on the hardware. Not fixed: short 8K jumps that decode on to the target
-take 1.6–4.3 s (it assumes the hardware decodes much faster than real time; at 8K it manages ~1.8×).
+8K: the same, all jumps on the hardware.
+
+**Short 8K jumps were slow (1.4–3.9 s).** They decoded on from the keyframe before the target,
+taking the hardware decoder to be much faster than real time. That holds at 1080p (~1,200 frames/s)
+but not at 8K (~110 frames/s). Jumps now estimate the decoder's speed from the video's size and
+frame rate (about 2.5 billion pixels a second), and decode on only as far as it gets in 0.75 s:
+about 1 s of 8K60, 30 s of 1080p30. Further, they land on the nearest keyframe. 8K ±10 s jumps:
+0.23–0.8 s (before: 1.4–3.9 s), landing about 1.5 s from the target. 6K and 1080p unchanged.
