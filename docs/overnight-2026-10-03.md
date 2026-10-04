@@ -462,3 +462,19 @@ back to the hardware when it recovers would be the fix.
 
 Checked on the headset with `bench-seek` (exit 0): 6K and 8K with a second decoder session (12 failed
 flushes each, all replaced on the hardware, never the CPU), 6K, 8K and 1080p H.264 without one.
+
+### Later that night (not yet measured on the headset: it went offline at ~02:45)
+
+- **Where the rest of a jump's wait goes.** Traced on the headset: each 1 MiB read after a jump waits
+  behind the up to 5 reads still in flight for the old position (they can't be cancelled). On the
+  Wi-Fi at the time that was ~0.5 s. With 3 reads in flight instead of 6, `bench-seek` jumps were
+  ready in ~163 ms instead of ~300 ms (median, 2 alternating runs each); read throughput looked
+  lower but the Wi-Fi varied too much to tell (86–178 vs 147–204 Mbit/s). With a +5 s jump every
+  5 s the data was already read ahead in every setting. Not changed yet: it needs a throughput
+  check on 8K. An option is a full 6 reads only while little is buffered.
+- **Short jumps also take a keyframe up to 1 s after the target** (before, only one up to 1 s
+  before it), instead of decoding on to the target. At 6K (keyframes ~2 s apart) almost every short
+  jump now lands on a keyframe, skipping the ~0.4 s of decoding after the keyframe preview.
+  Unit tests only.
+- **Large pictures are copied into the upload buffer by 4 threads** (over 16 MB: 6K and 8K). One
+  core copies 8K in ~2.5 ms, with spikes to 9 ms in the 13.9 ms frame. Unit tests only; not installed.
