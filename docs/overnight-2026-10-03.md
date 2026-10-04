@@ -554,3 +554,16 @@ Steam session; 8K never does.
 - 1080p H.264 (replaced at every jump): replacement 33 ms vs 42 ms; ready median unchanged (126–130 ms).
 - **6K not measured yet:** Steam holds two sessions since its blocked suspend, so 6K doesn't qualify
   and ran as before (no failures).
+
+**The next picture is copied between frames, not within one.** Copying a picture into the
+staging buffer (6K: 2 ms, at worst 4–9 ms; 8K: 3 ms, at worst 10–18 ms) happened after
+`xrWaitFrame`, against the frame's deadline. Now, after `xrEndFrame`, the picture due at the next
+display time is copied into the staging buffer of the slot the next frame records into, during
+time the loop would spend waiting for the runtime. The frame then only records the upload. A
+picture other than the one copied ahead (a jump, a skip) is copied as before. `Timing: frames`
+shows it as "copy ahead", outside "loop work".
+- Measured in the real OpenXR loop (`JUST_VIDEO_RENDER_UNSEEN=1`, nobody wearing the headset, 72 Hz):
+  - 6K: the copy within the frame went from 1.9/3.5–4.5 ms (mean/max) to 0.0/0.0; every picture was copied ahead.
+  - 1080p30: the same, with loop work max 1.0 ms. 0 periods missed, before and after.
+- **8K not measured yet** (Steam's second session keeps it on the CPU). It is the case this is for:
+  its worst copies took more than a whole 72 Hz frame.
