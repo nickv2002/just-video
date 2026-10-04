@@ -463,18 +463,20 @@ back to the hardware when it recovers would be the fix.
 Checked on the headset with `bench-seek` (exit 0): 6K and 8K with a second decoder session (12 failed
 flushes each, all replaced on the hardware, never the CPU), 6K, 8K and 1080p H.264 without one.
 
-### Later that night (not yet measured on the headset: it went offline at ~02:45)
+### Oct 4 morning (measured after the headset came back)
 
-- **Where the rest of a jump's wait goes.** Traced on the headset: each 1 MiB read after a jump waits
-  behind the up to 5 reads still in flight for the old position (they can't be cancelled). On the
-  Wi-Fi at the time that was ~0.5 s. With 3 reads in flight instead of 6, `bench-seek` jumps were
-  ready in ~163 ms instead of ~300 ms (median, 2 alternating runs each); read throughput looked
-  lower but the Wi-Fi varied too much to tell (86–178 vs 147–204 Mbit/s). With a +5 s jump every
-  5 s the data was already read ahead in every setting. Not changed yet: it needs a throughput
-  check on 8K. An option is a full 6 reads only while little is buffered.
-- **Short jumps also take a keyframe up to 1 s after the target** (before, only one up to 1 s
-  before it), instead of decoding on to the target. At 6K (keyframes ~2 s apart) almost every short
-  jump now lands on a keyframe, skipping the ~0.4 s of decoding after the keyframe preview.
-  Unit tests only.
-- **Large pictures are copied into the upload buffer by 4 threads** (over 16 MB: 6K and 8K). One
-  core copies 8K in ~2.5 ms, with spikes to 9 ms in the 13.9 ms frame. Unit tests only; not installed.
+- **3 reads in flight instead of 6.** Each read after a jump waits behind the reads still in flight
+  for the old position (they can't be cancelled). 8K random jumps, 2 rounds: network wait median
+  128–162 ms with 3, against 195–323 ms with 6. Steady 8K for 90 s: no stall, nothing behind, with 3,
+  with 6, and with pacing (2–4 depending on what's buffered; no better than a plain 3, not kept).
+- **Short jumps also take a keyframe up to 1 s after the target** (before: only one up to 1 s before
+  it), rather than decoding on to the target (~0.4 s at 6K). Unit tests; the headset runs had no
+  jump this changes, and no regression (+5 s every 4 s on 6K: mean 148 ms vs 227 ms installed,
+  within the Wi-Fi spread).
+- **6K and 8K pictures are copied by 4 threads.** 8K in `bench-seek --play`: copy 3.0–3.1 ms mean vs
+  3.6 ms; the worst copies (14–18 ms there) didn't change.
+- **`scripts/frame-keep-awake.sh [HOURS]`** stops Steam suspending the headset during tests (it
+  sleeps after 1 h without input, even on the charger, as it did at 02:24). It holds a logind
+  inhibitor through the user's service manager (polkit refuses it to an SSH session).
+  `stop` ends it. Not yet seen to stop a suspend.
+- Test runs now mute the headset first (`wpctl set-mute`), so playback tests make no sound.
