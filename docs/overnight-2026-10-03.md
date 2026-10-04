@@ -543,3 +543,14 @@ used. Meanwhile:
 - A VR app's session stays SYNCHRONIZED and never draws.
 A virtual mouse (`/dev/uinput`, 1 px right and back) doesn't count as use. 6K and 1080p tests over
 SSH are unaffected.
+
+**A replaced decoder is now freed in the background when the driver allows it.** A replacement at a jump
+took 75 ms median (6K): 6 ms waiting for the player to drop its frames, **49 ms freeing the old
+session**, 15 ms opening the new one. The old one is now freed on a thread while the new one opens
+and the jump's data arrives. The new one waits for it before it starts decoding. This is used only
+when the load check above passes with the old session still counted. Other processes' sessions
+are counted from `/proc` (Steam's run as the same user). 1080p always qualifies; 6K does with one
+Steam session; 8K never does.
+- 1080p H.264 (replaced at every jump): replacement 33 ms vs 42 ms; ready median unchanged (126–130 ms).
+- **6K not measured yet:** Steam holds two sessions since its blocked suspend, so 6K doesn't qualify
+  and ran as before (no failures).
