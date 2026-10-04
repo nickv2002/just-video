@@ -388,3 +388,24 @@ but not at 8K (~110 frames/s). Jumps now estimate the decoder's speed from the v
 frame rate (about 2.5 billion pixels a second), and decode on only as far as it gets in 0.75 s:
 about 1 s of 8K60, 30 s of 1080p30. Further, they land on the nearest keyframe. 8K ±10 s jumps:
 0.23–0.8 s (before: 1.4–3.9 s), landing about 1.5 s from the target. 6K and 1080p unchanged.
+
+## Oct 4: checked against Steam's real decoder session, and the first seconds of sound
+
+**After a restart (Steam's web helper holding a decoder session again):** 6K and 8K `bench-seek`
+pass twice each. One failure per video (the first jump's flush), then every jump on the
+hardware, shown in 0.26–0.81 s.
+
+**The first seconds after opening or a jump.** The sound started as soon as it was decoded,
+before the first picture. The picture then started up to 0.5 s behind it, skipped frames to
+catch up, and the sound ran short meanwhile. Now each start's sound waits, queued, for its first
+picture. (The first start never waited, because the audio thread's "generation playing" began at 0,
+the first generation; fixed.) First 5 s after opening:
+
+| | Picture vs sound | Skipped pictures | Waited for sound |
+|---|---|---|---|
+| Before (8K, 6K, 1080p) | −460 to −526 ms | 11–26 | 0–19 ms |
+| After | within ±25 ms | 0–2 | 0 ms |
+
+Playing with a jump every 1.5 s (6K): 799 pictures shown vs 558, 56 ticks behind vs 166, waited for
+sound at most 17 ms per 5 s vs 111. 8K and 1080p: as good or better. The log's "nearly dry" no
+longer counts the first writes into the empty buffer after a start.
