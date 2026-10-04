@@ -366,6 +366,19 @@ the hardware decoder fails at a jump and the CPU takes over, so it works as a ch
 **Cause confirmed (Oct 4):** with Steam's web helper process holding the decoder stopped (Steam
 restarted it without opening the decoder again), 8K jumps had no failures and stayed on the
 hardware. 6K had no failures in one run, and one failure that recovered on the hardware in
-another. Steam may open its session again (at the latest on the next boot). The fix in the
-player: close the old decoder before a new one opens at a jump (the renderer would have to let go
-of the picture on screen).
+another. Steam may open its session again (at the latest on the next boot).
+
+**Fixed: the old decoder closes before a new one opens.** The renderer copies each picture, so
+the player now lets go of its frames at a jump (the picture stays on screen). The decode thread
+waits until no frame of the old decoder is left (at most 0.3 s), frees it, then opens a new one.
+HEVC still flushes at jumps until a flush fails once; from then on, and always for H.264, every
+jump gets a new decoder this way (70–90 ms). Measured with another hardware decoder session
+running (a 1080p decode in the background, standing in for Steam's):
+
+| 6K jumps, with a second session | Before | After |
+|---|---|---|
+| Hardware failures | 3, then the CPU for the rest | 1 (the first flush), then hardware |
+| Jumps shown | 0.4–0.9 s (CPU) | 0.15–0.7 s (once 1.4 s) |
+
+8K: the same, all jumps on the hardware. Not fixed: short 8K jumps that decode on to the target
+take 1.6–4.3 s (it assumes the hardware decodes much faster than real time; at 8K it manages ~1.8×).
