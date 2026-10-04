@@ -554,6 +554,11 @@ Steam session; 8K never does.
 - 1080p H.264 (replaced at every jump): replacement 33 ms vs 42 ms; ready median unchanged (126–130 ms).
 - **6K not measured yet:** Steam holds two sessions since its blocked suspend, so 6K doesn't qualify
   and ran as before (no failures).
+- **Unverified:** sessions are counted as open files on the device. If Steam holds two files per
+  session, 6K never qualifies. Check how many it holds while 8K still opens on the hardware.
+- **Fixed regression:** counting reads ~4000 open files (8.5 ms in Python on the headset), and it ran on
+  every jump: 6K decoder time per jump 168–172 ms vs 146–157 before. The count is now kept and
+  refreshed on a thread every 5 s or more, starting when a hardware decoder opens: 155–158 ms.
 
 **The next picture is copied between frames, not within one.** Copying a picture into the
 staging buffer (6K: 2 ms, at worst 4–9 ms; 8K: 3 ms, at worst 10–18 ms) happened after
