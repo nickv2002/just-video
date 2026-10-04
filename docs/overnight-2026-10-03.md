@@ -418,3 +418,47 @@ longer counts the first writes into the empty buffer after a start.
   opening or listing failed outright. The SMB library now tries the name three times (0.1 s,
   0.2 s apart), then uses the address that last worked in this run. Covered by a unit test; not
   seen to happen again in 6 runs.
+
+## Night of Oct 4: faster jumps
+
+Your session at 01:19 (6K VR180, ~90 jumps, mostly +5 s) was the guide. The frame loop was fine
+(0 display periods missed, loop work under 7 ms at 60 Hz). Jumps took 0.15–0.7 s. Splitting each one:
+decoder ~30 ms while flushing worked, ~150 ms after the first failed flush; the rest waiting for the
+network (median ~140 ms, up to 490).
+
+1. **Why flushes fail, found.** The kernel log says `qcom-iris: current session not supported(-12)`
+   when the flushed decoder restarts its input. The iris driver checks the load of all open
+   sessions then. With another session open (Steam's web helper, or the stand-in), a flushed
+   6K/8K decoder is refused. A new session passes, so replacing the decoder works. It isn't
+   memory, as the notes above guessed. A failed flush, then replacing, costs about what replacing
+   up front costs (~145 vs ~150 ms of decoder time), and a flush that works costs ~30 ms. So every
+   jump tries the flush again, instead of replacing for the rest of the app session after one
+   failure. With another session: same speed as before. Without one: ~30 ms instead of ~150 ms of
+   decoder time per jump. In your session, flushes worked for 12 jumps before the first failure.
+2. **Jumping back into what was just played no longer reads it again.** The reader kept only the
+   last 8 MiB (under 1.5 s of 6K); it now keeps 192 MiB (~30 s of 6K or 8K). 6K, play 6 s then −5 s,
+   two alternating pairs: ready median **34 ms instead of 151–182 ms**, network wait ~0. A larger
+   read-ahead (96 MiB instead of 32) did not help +5 s jumps: with 4 s between them the data was
+   already there, and with 1.5 s between them the Wi-Fi is the limit. Not kept.
+3. **A +5 s jump in 8K no longer waits seconds.** With keyframes 10 s apart and none within 2.5 s
+   of the target, a short jump fell back to decoding 6 s of 8K (~4.5 s of a still picture). On the
+   hardware it now lands on the keyframe in the jump's direction when exact would take over 1.5 s.
+   8K "5 × +5 s" in `bench-seek`: **0.4–1.1 s instead of 3.9–6.1 s**.
+4. **A picture stuck after a jump (found while testing).** After a failed flush and replacement (the
+   old build did this too, but only once per app session), the first frame came out stamped 0 s. The player set its clock to the start, so
+   every real picture looked minutes in the future, and the video stood still until it was closed
+   (1 run in ~5 of 6K with a jump every 1.5 s). Now frames from more than 1 s before the jump's keyframe are
+   dropped. FFmpeg also no longer passes on empty decoder buffers as pictures (patch 0003). That
+   case hasn't shown up in the log yet, so the frame's cause is still unknown.
+
+**Also seen:** the iris firmware crashed twice during tonight's tests, both times between two
+test runs. Each time the system's own service (`iris-driver-rebind`) restarted the driver after
+~15 s. A video opened in those seconds fell back to the CPU for good. Once more at 00:45 tonight,
+before these changes. Three more runs with the same tests didn't repeat it. Not fixed: switching
+back to the hardware when it recovers would be the fix.
+
+`bench-seek --play N --jump-every S --jump-by D` now also jumps back (negative D).
+`JUST_VIDEO_FFMPEG_LOG=debug` shows FFmpeg's own log (decoder driver messages).
+
+Checked on the headset with `bench-seek` (exit 0): 6K and 8K with a second decoder session (12 failed
+flushes each, all replaced on the hardware, never the CPU), 6K, 8K and 1080p H.264 without one.

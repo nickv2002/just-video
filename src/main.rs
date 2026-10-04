@@ -194,6 +194,9 @@ enum Command {
         /// With `--play`: jump +5 s this often (seconds), like D-pad presses.
         #[arg(long)]
         jump_every: Option<f64>,
+        /// ...by this much instead (seconds; negative jumps back).
+        #[arg(long, default_value_t = 5.0, allow_negative_numbers = true)]
+        jump_by: f64,
         /// Print the full report as JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -1324,6 +1327,7 @@ fn main() -> anyhow::Result<()> {
             play,
             hz,
             jump_every,
+            jump_by,
             json,
             read_ahead,
         } => {
@@ -1357,6 +1361,7 @@ fn main() -> anyhow::Result<()> {
                     play,
                     hz,
                     jump_every,
+                    jump_by,
                 },
             )?;
             if json {
