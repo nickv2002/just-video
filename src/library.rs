@@ -244,6 +244,9 @@ impl OpenTiming {
     }
 }
 
+/// How long a video waits for its subtitle files once the video itself is ready.
+const SIDECAR_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Opens `path` for playback on its own `sessions` (the file is read over
 /// all of them; see [`SmbSession::open_striped`]): subtitles next to it,
 /// the file, its streams, then the decoder.
@@ -259,26 +262,40 @@ pub fn open_video(
     let name = path.last().cloned().unwrap_or_default();
     let session = sessions.first().ok_or("No connection")?;
     // Subtitle files load alongside: their folder listing and reads are
-    // round trips the video doesn't need to wait for.
-    let (external_subtitles, media) = std::thread::scope(|scope| {
-        let sidecars = scope.spawn(|| {
-            let started = std::time::Instant::now();
-            let found = load_sidecars(session, share, path);
-            (found, started.elapsed().as_secs_f64() * 1e3)
+    // round trips the video doesn't need to wait for. If they are still not
+    // there a moment after the video is, it starts without them (a stalled
+    // listing of a big folder once held a video back by 15 s).
+    let (sidecars, found) = mpsc::channel();
+    {
+        let (session, share, path) = (session.clone(), share.to_string(), path.clone());
+        std::thread::Builder::new()
+            .name("sidecars".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let files = load_sidecars(&session, &share, &path);
+                let _ = sidecars.send((files, started.elapsed().as_secs_f64() * 1e3));
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    let media = SmbSession::open_striped(sessions, share, &smb_path(path), ReadAhead::default())
+        .map_err(err)
+        .and_then(|reader| {
+            timing.lap("open file");
+            Media::open(&name, reader).map_err(err)
         });
-        let media =
-            SmbSession::open_striped(sessions, share, &smb_path(path), ReadAhead::default())
-                .map_err(err)
-                .and_then(|reader| {
-                    timing.lap("open file");
-                    Media::open(&name, reader).map_err(err)
-                });
-        timing.lap("probe");
-        let (found, ms) = sidecars.join().unwrap_or_default();
-        timing.lap("rest of sidecars");
-        timing.note(format!("sidecars {ms:.0} alongside"));
-        (found, media)
-    });
+    timing.lap("probe");
+    let external_subtitles = match found.recv_timeout(SIDECAR_GRACE) {
+        Ok((files, ms)) => {
+            timing.note(format!("sidecars {ms:.0} alongside"));
+            files
+        }
+        Err(_) => {
+            eprintln!("Subtitles: still looking after {SIDECAR_GRACE:?}; playing without");
+            timing.note("sidecars given up".into());
+            Vec::new()
+        }
+    };
+    timing.lap("rest of sidecars");
     let media = media?;
     timing.note(format!("probe read {}", media.io()));
     let video = media.info().video.clone();
