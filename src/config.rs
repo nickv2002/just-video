@@ -296,6 +296,51 @@ struct Settings {
     favourite_formats: Option<Vec<Format>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     captions: Option<CaptionSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sort: Option<SortMode>,
+}
+
+/// How a folder's files are ordered (folders always come first, by name).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SortMode {
+    /// A-Z, as the server lists them.
+    #[default]
+    Name,
+    /// Largest first.
+    Size,
+    /// Started videos, then unseen ones, then watched ones.
+    Unwatched,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            SortMode::Name => SortMode::Size,
+            SortMode::Size => SortMode::Unwatched,
+            SortMode::Unwatched => SortMode::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Name => "A-Z",
+            SortMode::Size => "Largest",
+            SortMode::Unwatched => "Unwatched",
+        }
+    }
+}
+
+pub fn sort_mode() -> SortMode {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.sort)
+        .unwrap_or_default()
+}
+
+pub fn save_sort_mode(mode: SortMode) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.sort = Some(mode);
+    write_json("settings.json", &settings, false)
 }
 
 /// Subtitle size and position, the same for every video.
