@@ -17,6 +17,7 @@
 //! screen.
 
 use super::canvas::{Canvas, Fonts, Rgb};
+use crate::ab_loop::AbLoop;
 use crate::config::ImageAdjust;
 use crate::vr::{Projection, Stereo};
 
@@ -101,6 +102,8 @@ pub enum Hit {
     Screen,
     /// Opens the image dialog.
     Image,
+    /// A-B loop: set A, set B, clear.
+    Loop,
     // In the dialogs:
     AudioTrack(usize),
     /// A subtitle track, or None for off.
@@ -162,6 +165,8 @@ pub struct State {
     pub dialog: Option<Dialog>,
     /// Editing subtitle size and position: the bar holds only those buttons.
     pub caption_edit: bool,
+    /// The A-B loop (marks on the seek bar, button state).
+    pub ab_loop: AbLoop,
 }
 
 type Rect = (f32, f32, f32, f32);
@@ -169,6 +174,7 @@ type Rect = (f32, f32, f32, f32);
 const PREVIOUS: Rect = (24.0, 16.0, 96.0, 92.0);
 const PLAY: Rect = (136.0, 16.0, 96.0, 92.0);
 const NEXT: Rect = (248.0, 16.0, 96.0, 92.0);
+const LOOP: Rect = (392.0, 16.0, 96.0, 92.0);
 const CAPTIONS: Rect = (818.0, 16.0, 96.0, 92.0);
 const SCREEN: Rect = (948.0, 16.0, 96.0, 92.0);
 const IMAGE: Rect = (1078.0, 16.0, 96.0, 92.0);
@@ -206,6 +212,7 @@ pub fn hit(state: &State, x: f32, y: f32) -> Hit {
         (PREVIOUS, Hit::Previous, state.has_previous),
         (PLAY, Hit::PlayPause, true),
         (NEXT, Hit::Next, state.has_next),
+        (LOOP, Hit::Loop, state.duration > 0.0),
         (CAPTIONS, Hit::Captions, can_caption),
         (SCREEN, Hit::Screen, true),
         (IMAGE, Hit::Image, true),
@@ -529,6 +536,11 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
     };
     label_under(&mut c, fonts, CAPTIONS, &caption_label);
 
+    let looping = state.ab_loop.a().is_some();
+    button(&mut c, LOOP, hover == Hit::Loop, looping);
+    centered(&mut c, fonts, "A-B", LOOP, 34.0, TEXT);
+    label_under(&mut c, fonts, LOOP, state.ab_loop.label());
+
     let screen_fill = if hover == Hit::Screen { HOVER } else { BUTTON };
     button(&mut c, SCREEN, hover == Hit::Screen, false);
     screen_icon(
@@ -574,6 +586,12 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
         0.0
     };
     c.rect(sx, track_y - 6.0, sw * fraction, 12.0, 6.0, ACCENT);
+    if state.duration > 0.0 {
+        for mark in [state.ab_loop.a(), state.ab_loop.b()].into_iter().flatten() {
+            let x = sx + sw * (mark / state.duration).clamp(0.0, 1.0) as f32;
+            c.rect(x - 3.0, track_y - 20.0, 6.0, 40.0, 3.0, SUBTLE);
+        }
+    }
     if let Hit::Seek(f) = hover {
         c.rect(sx + sw * f - 2.0, track_y - 22.0, 4.0, 44.0, 2.0, SUBTLE);
         let label = format_time(f as f64 * state.duration);
@@ -738,6 +756,7 @@ mod tests {
             image: ImageAdjust::default(),
             dialog: None,
             caption_edit: false,
+            ab_loop: AbLoop::default(),
         }
     }
 
@@ -756,6 +775,7 @@ mod tests {
         for (r, h) in [
             (PREVIOUS, Hit::Previous),
             (PLAY, Hit::PlayPause),
+            (LOOP, Hit::Loop),
             (NEXT, Hit::Nothing),     // no next video
             (CAPTIONS, Hit::Nothing), // no subtitles, one audio track
             (SCREEN, Hit::Screen),

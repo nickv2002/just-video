@@ -925,6 +925,12 @@ fn main() -> anyhow::Result<()> {
             use just_video::ui::controls;
             let state = controls::State {
                 paused: true,
+                ab_loop: {
+                    let mut l = just_video::ab_loop::AbLoop::default();
+                    l.press(1000.0);
+                    l.press(2500.0);
+                    l
+                },
                 position: 754.0,
                 duration: 5530.0,
                 has_previous: true,

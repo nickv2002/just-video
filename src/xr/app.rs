@@ -628,6 +628,7 @@ pub fn run(
     let mut caption_at: Option<(xr::Posef, [f32; 2])> = None;
     // Editing subtitle size and position (from the track dialog).
     let mut caption_edit = false;
+    let mut ab_loop = crate::ab_loop::AbLoop::default();
     let mut cursor = renderer.create_quad(&ctx, CURSOR_PX, CURSOR_PX)?;
     renderer.upload_quad(&mut cursor, &cursor_image())?;
 
@@ -817,6 +818,7 @@ pub fn run(
                     renderer.set_adjust(&playback.image);
                     dialog = None;
                     caption_edit = false;
+                    ab_loop.clear();
                     mode = Mode::Playing(Box::new(playback));
                     ctx.frame_stream
                         .end(state.predicted_display_time, ctx.blend_mode, &[])?;
@@ -917,6 +919,9 @@ pub fn run(
                     resume_saved_at = Instant::now();
                     save_resume(playing_key.as_ref(), playback);
                 }
+                if let Some(back) = ab_loop.jump(playback.position()) {
+                    playback.seek(back);
+                }
                 let curved_applies = playback.layout.projection == Projection::Flat;
                 let ui_state = controls::State {
                     paused: playback.paused(),
@@ -936,6 +941,7 @@ pub fn run(
                     image: playback.image,
                     dialog,
                     caption_edit,
+                    ab_loop,
                 };
                 // The pointer on the dialog (above the bar) or on the bar.
                 let dialog_at = controls_panel_at
@@ -1055,6 +1061,7 @@ pub fn run(
                 match clicked {
                     Some(controls::Hit::PlayPause) => playback.toggle_pause(now),
                     Some(controls::Hit::Seek(f)) => playback.seek(f as f64 * playback.duration),
+                    Some(controls::Hit::Loop) => ab_loop.press(playback.position()),
                     Some(controls::Hit::Previous) => switch_video = Some(-1),
                     Some(controls::Hit::Next) => switch_video = Some(1),
                     // CC: subtitles on/off (or, with none, straight to audio tracks).
