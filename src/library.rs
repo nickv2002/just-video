@@ -298,7 +298,9 @@ pub fn open_video(
     let mut decoder = media.into_decoder(hw, true, "").map_err(err)?;
     timing.lap("open decoder");
     decoder.requested_at = Some(timing.requested);
-    let resume = config::resume_position(&key);
+    // A file replaced by a shorter one must not resume past its end.
+    let resume = config::resume_position(&key)
+        .filter(|&at| !config::near_end(at, decoder.info().duration_seconds));
     timing.log(&name);
     Ok(Box::new(Opened {
         decoder,
