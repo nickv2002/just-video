@@ -807,7 +807,9 @@ pub fn run(
         }
         if stop_playback {
             set_phase(3);
+            let mut failure = None;
             if let Mode::Playing(playback) = std::mem::replace(&mut mode, Mode::Browser) {
+                failure = playback.error.clone();
                 input.wait_for_dpad_release();
                 timing.report(period);
                 timing.restart();
@@ -828,7 +830,7 @@ pub fn run(
                     nav.open_adjacent(delta);
                     nav.redraw();
                 }
-                Some(nav) => nav.playback_ended(),
+                Some(nav) => nav.playback_ended(failure),
                 None => options.quit.store(true, Ordering::Relaxed),
             }
         }

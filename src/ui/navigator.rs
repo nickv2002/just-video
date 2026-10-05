@@ -1049,7 +1049,9 @@ impl Navigator {
     }
 
     /// Back from playing: outlines the video that played, and keeps it in view.
-    pub fn playback_ended(&mut self) {
+    /// `error`: why decoding stopped early (the connection dropped, the file
+    /// is damaged), told to the viewer instead of just leaving the video.
+    pub fn playback_ended(&mut self, error: Option<String>) {
         // The next video likely comes from the same folder.
         if let Location::Folder { server, share, .. } = &self.location {
             self.library.send(Request::Warm {
@@ -1064,6 +1066,9 @@ impl Navigator {
         self.reload_played_layout();
         self.restore_scroll();
         self.rebuild_rows();
+        if let Some(error) = error {
+            self.dialog("Playback stopped", vec![error]);
+        }
     }
 
     /// The video that played may have had its format changed: mark it as saved.
@@ -1860,9 +1865,15 @@ mod tests {
         );
         nav.playing = Some(4);
         assert!(!nav.has_adjacent(1));
-        nav.playback_ended();
+        nav.playback_ended(None);
         assert!(nav.view().rows[4].outlined, "the video just played");
         assert_eq!(nav.view().rows.iter().filter(|r| r.outlined).count(), 1);
+        assert!(!nav.dialog_open());
+        // Decoding that stopped on an error says so.
+        nav.playback_ended(Some("The server stopped sending data".into()));
+        let dialog = nav.view().dialog.as_ref().expect("explained");
+        assert_eq!(dialog.title, "Playback stopped");
+        assert!(dialog.body[0].contains("stopped sending"));
     }
 
     fn video_folder(nav: &mut Navigator, names: &[&str]) {
