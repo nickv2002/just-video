@@ -1327,6 +1327,9 @@ impl Library {
                                         job.path.last().map_or("", |n| n.as_str())
                                     );
                                 }
+                                // The queue may stay unfinished until the app
+                                // quits from the video: keep what was read.
+                                ProbeCache::save(&cache);
                                 let _ = requeue.send(job);
                                 continue;
                             };
