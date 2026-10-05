@@ -467,14 +467,11 @@ struct AudioChunk {
     samples: Vec<f32>,
 }
 
-/// Highest volume level (1 = as decoded).
-const MAX_LEVEL: f32 = 1.5;
-
 /// State shared with the audio thread.
 struct AudioShared {
     generation: AtomicU64,
     paused: AtomicBool,
-    /// Volume 0..=1.5 as f32 bits (above 1: boosted, limited).
+    /// Volume 0..=1 as f32 bits.
     volume: AtomicU32,
     /// Media time heard at an instant, for the current generation.
     clock: Mutex<Option<(u64, f64, Instant)>>,
@@ -574,7 +571,7 @@ fn spawn_audio(
             let mut played_generation = u64::MAX;
             // Slices written since the generation started.
             let mut fresh_slices = 0;
-            let mut gain = crate::audio::Gain::default();
+            let gain = crate::audio::Gain;
             let mut watch = AudioWatch::new();
             while !stop.load(Ordering::Relaxed) {
                 watch.maybe_log();
@@ -1848,7 +1845,7 @@ impl Playback {
             Arc::new(AudioShared {
                 generation: AtomicU64::new(0),
                 paused: AtomicBool::new(false),
-                volume: AtomicU32::new(volume.clamp(0.0, MAX_LEVEL).to_bits()),
+                volume: AtomicU32::new(volume.clamp(0.0, 1.0).to_bits()),
                 clock: Mutex::new(None),
                 pictured: AtomicU64::new(u64::MAX),
             })
@@ -2070,14 +2067,6 @@ impl Playback {
 
     pub fn has_audio(&self) -> bool {
         self.audio.is_some()
-    }
-
-    pub fn set_volume(&self, volume: f32) {
-        if let Some(audio) = &self.audio {
-            audio
-                .volume
-                .store(volume.clamp(0.0, MAX_LEVEL).to_bits(), Ordering::Relaxed);
-        }
     }
 
     /// Media time shown at display time `now` (ns), once the clock started.
