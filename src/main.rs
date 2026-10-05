@@ -792,6 +792,10 @@ fn print(value: serde_json::Value) -> anyhow::Result<()> {
 /// many FFmpeg contexts from several threads; with glibc's defaults the freed
 /// heap stayed resident (a 36-video folder: 270 MB after, 31 MB with this).
 fn trim_freed_memory() {
+    // JUST_VIDEO_NO_TRIM: for comparing with glibc's defaults.
+    if std::env::var_os("JUST_VIDEO_NO_TRIM").is_some() {
+        return;
+    }
     // SAFETY: plain call, before other threads exist. Setting the trim
     // threshold also fixes the mmap threshold, so big buffers are mapped
     // and unmapped, not kept in the heap.
