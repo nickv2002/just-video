@@ -254,6 +254,28 @@ struct Resume {
     seconds: f64,
     /// Unix time of the save; the oldest are forgotten first.
     saved: u64,
+    /// Played to the end (`seconds` is then unused).
+    #[serde(default)]
+    watched: bool,
+}
+
+/// What is remembered about a video's progress.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Place {
+    /// Left part way, at this many seconds.
+    Resume(f64),
+    /// Played to (near) the end.
+    Watched,
+}
+
+impl Resume {
+    fn place(&self) -> Place {
+        if self.watched {
+            Place::Watched
+        } else {
+            Place::Resume(self.seconds)
+        }
+    }
 }
 
 /// Videos whose place is remembered; older ones are forgotten.
@@ -264,20 +286,53 @@ static RESUME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Where to continue a file from, if it was left part way.
 pub fn resume_position(key: &str) -> Option<f64> {
-    let all: BTreeMap<String, Resume> = read_json("resume.json").ok()?;
-    all.get(key).map(|r| r.seconds)
+    match places().get(key) {
+        Some(Place::Resume(seconds)) => Some(*seconds),
+        _ => None,
+    }
+}
+
+/// Progress of every remembered video, by file key (one read of a small file,
+/// for marking a whole folder).
+pub fn places() -> BTreeMap<String, Place> {
+    read_json::<BTreeMap<String, Resume>>("resume.json")
+        .map(|all| all.into_iter().map(|(k, r)| (k, r.place())).collect())
+        .unwrap_or_default()
 }
 
 /// Remembers (or with `None`, forgets) where a file was left.
 pub fn save_resume_position(key: &str, seconds: Option<f64>) -> anyhow::Result<()> {
+    update_place(key, |_| seconds.map(Place::Resume))
+}
+
+/// Records a video stopped at `position`: where to continue, or watched.
+pub fn save_stop(key: &str, position: f64, duration: f64) -> anyhow::Result<()> {
+    update_place(key, |previous| stop_place(position, duration, previous))
+}
+
+/// Forgets or sets the progress of `key`, from what is saved now.
+fn update_place(key: &str, f: impl FnOnce(Option<Place>) -> Option<Place>) -> anyhow::Result<()> {
     let _guard = RESUME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut all: BTreeMap<String, Resume> = read_json("resume.json")?;
-    match seconds {
-        Some(seconds) => {
+    let previous = all.get(key).map(Resume::place);
+    match f(previous) {
+        Some(Place::Watched) if previous == Some(Place::Watched) => return Ok(()),
+        Some(place) => {
             let saved = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            all.insert(key.to_string(), Resume { seconds, saved });
+            let (seconds, watched) = match place {
+                Place::Resume(seconds) => (seconds, false),
+                Place::Watched => (0.0, true),
+            };
+            all.insert(
+                key.to_string(),
+                Resume {
+                    seconds,
+                    saved,
+                    watched,
+                },
+            );
             while all.len() > MAX_RESUMES {
                 let oldest = all
                     .iter()
@@ -291,6 +346,18 @@ pub fn save_resume_position(key: &str, seconds: Option<f64>) -> anyhow::Result<(
         None => {}
     }
     write_json("resume.json", &all, false)
+}
+
+/// What to remember for a video stopped at `position`. A watched video that is
+/// only opened briefly stays watched.
+pub fn stop_place(position: f64, duration: f64, previous: Option<Place>) -> Option<Place> {
+    if let Some(seconds) = resume_point(position, duration) {
+        return Some(Place::Resume(seconds));
+    }
+    if position >= 10.0 {
+        return Some(Place::Watched); // past the point worth resuming: near the end
+    }
+    (previous == Some(Place::Watched)).then_some(Place::Watched)
 }
 
 pub fn move_resume_position(from: &str, to: &str) -> anyhow::Result<()> {
@@ -329,6 +396,11 @@ struct Settings {
     captions: Option<CaptionSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     player: Option<Preferences>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sort: Option<SortMode>,
+    /// Start the next video in the folder when one ends.
+    #[serde(default)]
+    autoplay_next: bool,
 }
 
 /// Choices made on the Settings screen.
@@ -355,6 +427,36 @@ impl Default for Preferences {
             volume_step: 10,
             resume: true,
             thumbnails: false,
+        }
+    }
+}
+
+/// How a folder's files are ordered (folders always come first, by name).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SortMode {
+    /// A-Z, as the server lists them.
+    #[default]
+    Name,
+    /// Largest first.
+    Size,
+    /// Started videos, then unseen ones, then watched ones.
+    Unwatched,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            SortMode::Name => SortMode::Size,
+            SortMode::Size => SortMode::Unwatched,
+            SortMode::Unwatched => SortMode::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Name => "A-Z",
+            SortMode::Size => "Size",
+            SortMode::Unwatched => "Unseen",
         }
     }
 }
@@ -387,6 +489,31 @@ pub fn update_preferences(change: impl FnOnce(&mut Preferences)) -> anyhow::Resu
     settings.player = Some(prefs);
     write_json("settings.json", &settings, false)?;
     Ok(prefs)
+}
+
+pub fn autoplay_next() -> bool {
+    read_json::<Settings>("settings.json")
+        .map(|s| s.autoplay_next)
+        .unwrap_or(false)
+}
+
+pub fn save_autoplay_next(on: bool) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.autoplay_next = on;
+    write_json("settings.json", &settings, false)
+}
+
+pub fn sort_mode() -> SortMode {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.sort)
+        .unwrap_or_default()
+}
+
+pub fn save_sort_mode(mode: SortMode) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.sort = Some(mode);
+    write_json("settings.json", &settings, false)
 }
 
 /// Subtitle size and position, the same for every video.
@@ -449,6 +576,23 @@ pub fn save_favourite_formats(formats: &[Format]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopping_near_the_end_marks_watched() {
+        let (d, none) = (3600.0, None);
+        assert_eq!(stop_place(5.0, d, none), None);
+        assert_eq!(stop_place(754.0, d, none), Some(Place::Resume(754.0)));
+        assert_eq!(stop_place(3590.0, d, none), Some(Place::Watched));
+        assert_eq!(stop_place(3500.0, d, none), Some(Place::Watched)); // past 95%
+        // A watched video peeked at for a moment stays watched; a resume point is dropped.
+        assert_eq!(stop_place(2.0, d, Some(Place::Watched)), Some(Place::Watched));
+        assert_eq!(stop_place(2.0, d, Some(Place::Resume(900.0))), None);
+        // Watching it again part way replaces the mark.
+        assert_eq!(
+            stop_place(600.0, d, Some(Place::Watched)),
+            Some(Place::Resume(600.0))
+        );
+    }
 
     #[test]
     fn old_settings_files_still_parse() {
@@ -592,6 +736,14 @@ mod tests {
             Some(60.0),
             "another server whose address starts the same"
         );
+        let done = "smb://alice@192.168.1.10/media/VR/done.mp4";
+        save_stop(done, 3590.0, 3600.0).unwrap();
+        assert_eq!(places().get(done), Some(&Place::Watched));
+        assert_eq!(resume_position(done), None);
+        save_stop(done, 3.0, 3600.0).unwrap();
+        assert_eq!(places().get(done), Some(&Place::Watched));
+        save_stop(done, 900.0, 3600.0).unwrap();
+        assert_eq!(places().get(done), Some(&Place::Resume(900.0)));
         assert!(remove_server("NAS").unwrap());
         let server = moved;
         assert!(remove_server("Office PC").unwrap());

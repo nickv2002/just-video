@@ -309,11 +309,11 @@ fn save_layout(
 /// write may be slow).
 fn save_resume(key: Option<&String>, playback: &Playback) {
     let Some(key) = key.cloned() else { return };
-    let point = crate::config::resume_point(playback.position(), playback.duration);
+    let (position, duration) = (playback.position(), playback.duration);
     let _ = std::thread::Builder::new()
         .name("save resume".into())
         .spawn(move || {
-            if let Err(e) = crate::config::save_resume_position(&key, point) {
+            if let Err(e) = crate::config::save_stop(&key, position, duration) {
                 eprintln!("Can't save where the video was left: {e:#}");
             }
         });
@@ -643,6 +643,7 @@ pub fn run(
     let mut caption_at: Option<(xr::Posef, [f32; 2])> = None;
     // Editing subtitle size and position (from the track dialog).
     let mut caption_edit = false;
+    let mut ab_loop = crate::ab_loop::AbLoop::default();
     let mut cursor = renderer.create_quad(&ctx, CURSOR_PX, CURSOR_PX)?;
     renderer.upload_quad(&mut cursor, &cursor_image())?;
 
@@ -799,6 +800,14 @@ pub fn run(
             buttons.back = false;
         }
         // Leaving playback: B, end of video, or --duration reached.
+        if let Mode::Playing(playback) = &mode
+            && switch_video.is_none()
+            && !buttons.back
+            && playback.finished(now)
+            && navigator.as_ref().is_some_and(|n| n.autoplay_next())
+        {
+            switch_video = Some(1);
+        }
         let mut stop_playback = switch_video.is_some();
         if let Mode::Playing(playback) = &mut mode {
             let reached_end = options
@@ -904,6 +913,7 @@ pub fn run(
                     renderer.set_adjust(&playback.image);
                     dialog = None;
                     caption_edit = false;
+                    ab_loop.clear();
                     mode = Mode::Playing(Box::new(playback));
                     input.wait_for_dpad_release();
                     ctx.frame_stream
@@ -1084,6 +1094,9 @@ pub fn run(
                     resume_saved_at = Instant::now();
                     save_resume(playing_key.as_ref(), playback);
                 }
+                if let Some(back) = ab_loop.jump(playback.position()) {
+                    playback.seek(back);
+                }
                 let curved_applies = playback.layout.projection == Projection::Flat;
                 let ui_state = controls::State {
                     paused: playback.paused(),
@@ -1103,6 +1116,7 @@ pub fn run(
                     image: playback.image,
                     dialog,
                     caption_edit,
+                    ab_loop,
                 };
                 // The pointer on the dialog (above the bar) or on the bar.
                 let dialog_at = controls_panel_at
@@ -1264,6 +1278,7 @@ pub fn run(
                 match clicked {
                     Some(controls::Hit::PlayPause) => playback.toggle_pause(now),
                     Some(controls::Hit::Seek(f)) => playback.seek(f as f64 * playback.duration),
+                    Some(controls::Hit::Loop) => ab_loop.press(playback.position()),
                     Some(controls::Hit::Previous) => switch_video = Some(-1),
                     Some(controls::Hit::Next) => switch_video = Some(1),
                     // CC: subtitles on/off (or, with none, straight to audio tracks).
@@ -1695,9 +1710,9 @@ pub fn run(
     options.quit.store(true, Ordering::Relaxed);
     if let Mode::Playing(playback) = mode {
         // Written here, not in the background: the app is about to exit.
-        let point = crate::config::resume_point(playback.position(), playback.duration);
         if let Some(key) = &playing_key
-            && let Err(e) = crate::config::save_resume_position(key, point)
+            && let Err(e) =
+                crate::config::save_stop(key, playback.position(), playback.duration)
         {
             eprintln!("Can't save where the video was left: {e:#}");
         }

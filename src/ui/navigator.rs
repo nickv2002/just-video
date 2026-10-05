@@ -10,8 +10,9 @@
 
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, format_size};
 use super::form::{self, Field, Form, Key};
+use super::controls::format_time;
 use super::settings::{self, Setting};
-use crate::config::{self, Server};
+use crate::config::{self, Place, Server, SortMode};
 use crate::library::{
     Library, Opened, Path, ProbeVideo, Probed, Request, Response, ThumbVideo, file_key,
 };
@@ -27,6 +28,15 @@ const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mkv", "mov", "webm", "avi", "
 pub fn is_video(name: &str) -> bool {
     name.rsplit_once('.')
         .is_some_and(|(_, ext)| VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// A row's detail line with where the viewer left off: "Resume 12:34 · title".
+fn with_progress(detail: &str, place: Option<Place>) -> String {
+    match place {
+        Some(Place::Resume(seconds)) => format!("Resume {} · {detail}", format_time(seconds)),
+        Some(Place::Watched) => format!("Watched · {detail}"),
+        None => detail.to_string(),
+    }
 }
 
 /// Names from the top down to a place: server URL, share, folders.
@@ -114,6 +124,10 @@ impl Item {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ToolAction {
     ToggleEdit,
+    /// Next sort order.
+    CycleSort,
+    /// Start the next video when one ends, or stop.
+    ToggleAutoplay,
     StartSelect,
     ToggleThumbnails,
     CancelSelect,
@@ -144,6 +158,10 @@ pub struct Navigator {
     edit_mode: bool,
     /// What each header tool does.
     tool_actions: Vec<ToolAction>,
+    /// Progress of the videos played before, by file key (read once per folder).
+    places: std::collections::BTreeMap<String, Place>,
+    sort: SortMode,
+    autoplay: bool,
     /// The item being played (for previous/next).
     playing: Option<usize>,
     /// Navigation request whose answer we wait for.
@@ -197,6 +215,9 @@ impl Navigator {
             selecting: None,
             edit_mode: false,
             tool_actions: Vec::new(),
+            places: Default::default(),
+            sort: config::sort_mode(),
+            autoplay: config::autoplay_next(),
             playing: None,
             pending: None,
             pending_changes: HashSet::new(),
@@ -556,6 +577,64 @@ impl Navigator {
         self.view.scroll = scroll;
     }
 
+    /// Orders the open folder by the chosen sort. Row positions change, so
+    /// the playing index (for previous/next) is dropped.
+    fn sort_items(&mut self) {
+        let names: Vec<(String, Option<Place>)> = self
+            .items
+            .iter()
+            .map(|i| (i.name().to_string(), self.place_of(i.name())))
+            .collect();
+        let rank = |item: &Item| -> (u8, std::cmp::Reverse<u64>, u8, String) {
+            let name = item.name().to_lowercase();
+            let place = names
+                .iter()
+                .find(|(n, _)| n == item.name())
+                .and_then(|(_, p)| *p);
+            match (item, self.sort) {
+                (Item::Dir(_), _) => (0, std::cmp::Reverse(0), 0, name),
+                (_, SortMode::Name) => (1, std::cmp::Reverse(0), 0, name),
+                (Item::Video { size, .. } | Item::File { size, .. }, SortMode::Size) => {
+                    (1, std::cmp::Reverse(*size), 0, name)
+                }
+                (Item::Video { .. }, SortMode::Unwatched) => {
+                    let group = match place {
+                        Some(Place::Resume(_)) => 0,
+                        None => 1,
+                        Some(Place::Watched) => 2,
+                    };
+                    (1, std::cmp::Reverse(0), group, name)
+                }
+                (_, _) => (1, std::cmp::Reverse(0), 3, name),
+            }
+        };
+        let mut keyed: Vec<_> = std::mem::take(&mut self.items)
+            .into_iter()
+            .map(|item| (rank(&item), item))
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        self.items = keyed.into_iter().map(|(_, item)| item).collect();
+        self.playing = None;
+        self.rebuild_rows();
+    }
+
+    /// Progress marker of the video `name` in the open folder.
+    fn place_of(&self, name: &str) -> Option<Place> {
+        let Location::Folder {
+            server,
+            share,
+            path,
+        } = &self.location
+        else {
+            return None;
+        };
+        let mut file = path.clone();
+        file.push(name.to_string());
+        self.places
+            .get(&crate::library::file_key(server, share, &file))
+            .copied()
+    }
+
     fn rebuild_rows(&mut self) {
         let editing = self.editing();
         let selecting = self.selecting.as_ref();
@@ -600,12 +679,13 @@ impl Navigator {
                         detail: match (assessment, broken) {
                             (_, Some(_)) => "Can't read this file".into(),
                             (Some(a), None) => {
-                                match layout.as_ref().and_then(Layout::short_label) {
+                                let title = match layout.as_ref().and_then(Layout::short_label) {
                                     Some(format) => format!("{format}  ·  {}", a.title),
                                     None => a.title.clone(),
-                                }
+                                };
+                                with_progress(&title, self.place_of(name))
                             }
-                            (None, None) => "Checking…".into(),
+                            (None, None) => with_progress("Checking…", self.place_of(name)),
                         },
                         right: format_size(*size),
                         thumbnail: self.thumbs.get(name).cloned(),
@@ -632,7 +712,12 @@ impl Navigator {
             .collect();
         self.view.thumbnails = self.thumbnails_on();
         let has_entries = self.items.iter().any(Item::is_entry);
-        let tools: Vec<(Tool, ToolAction)> = match &self.selecting {
+        let videos = self
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::Video { .. }))
+            .count();
+        let mut tools: Vec<(Tool, ToolAction)> = match &self.selecting {
             Some(selected) => {
                 let mut tools = vec![(Tool::text("Cancel", false), ToolAction::CancelSelect)];
                 if !selected.is_empty() {
@@ -650,8 +735,16 @@ impl Navigator {
             }
             None => Vec::new(),
         };
-        let mut tools = tools;
-        // Only where there are videos, and not while picking what to delete.
+        if self.selecting.is_none() && videos >= 2 {
+            let label = format!("Sort: {}", self.sort.label());
+            let auto = Tool {
+                active: self.autoplay,
+                ..Tool::text("Autoplay", false)
+            };
+            tools.insert(0, (auto, ToolAction::ToggleAutoplay));
+            tools.insert(0, (Tool::text(label, false), ToolAction::CycleSort));
+        }
+        // The thumbnails toggle leads the header. Only where there are videos, and not while picking what to delete.
         if self.selecting.is_none() && self.in_video_folder() {
             let thumbnails = Tool::icon(ToolIcon::Thumbnails, self.prefs.thumbnails);
             tools.insert(0, (thumbnails, ToolAction::ToggleThumbnails));
@@ -708,6 +801,7 @@ impl Navigator {
                     };
                     match result {
                         Ok(entries) => {
+                            self.places = config::places();
                             let videos: Vec<ProbeVideo> = entries
                                 .iter()
                                 .filter(|e| {
@@ -768,7 +862,11 @@ impl Navigator {
                                 None
                             };
                             self.restore_scroll();
-                            self.rebuild_rows();
+                            if self.sort == SortMode::Name {
+                                self.rebuild_rows();
+                            } else {
+                                self.sort_items();
+                            }
                         }
                         Err(e) => self.set_status(format!(
                             "Can't open this folder: {e}  —  Press B to go back."
@@ -953,6 +1051,19 @@ impl Navigator {
     fn click_tool(&mut self, k: usize) {
         match self.tool_actions.get(k) {
             Some(ToolAction::ToggleEdit) => self.edit_mode = !self.edit_mode,
+            Some(ToolAction::CycleSort) => {
+                self.sort = self.sort.next();
+                if let Err(e) = config::save_sort_mode(self.sort) {
+                    eprintln!("Can't save the sort order: {e:#}");
+                }
+                self.sort_items();
+            }
+            Some(ToolAction::ToggleAutoplay) => {
+                self.autoplay = !self.autoplay;
+                if let Err(e) = config::save_autoplay_next(self.autoplay) {
+                    eprintln!("Can't save the autoplay setting: {e:#}");
+                }
+            }
             Some(ToolAction::StartSelect) => self.selecting = Some(HashSet::new()),
             Some(ToolAction::ToggleThumbnails) => self.toggle_thumbnails(),
             Some(ToolAction::CancelSelect) => self.selecting = None,
@@ -1052,6 +1163,7 @@ impl Navigator {
     /// `error`: why decoding stopped early (the connection dropped, the file
     /// is damaged), told to the viewer instead of just leaving the video.
     pub fn playback_ended(&mut self, error: Option<String>) {
+        self.places = config::places();
         // The next video likely comes from the same folder.
         if let Location::Folder { server, share, .. } = &self.location {
             self.library.send(Request::Warm {
@@ -1100,6 +1212,11 @@ impl Navigator {
                 self.request_thumbnails();
             }
         }
+    }
+
+    /// A video ended on its own: should the next one start?
+    pub fn autoplay_next(&self) -> bool {
+        self.autoplay && self.has_adjacent(1)
     }
 
     pub fn has_adjacent(&self, delta: isize) -> bool {
@@ -1628,6 +1745,124 @@ mod tests {
     }
 
     #[test]
+    fn progress_shows_in_the_detail_line() {
+        assert_eq!(with_progress("8K HEVC", None), "8K HEVC");
+        assert_eq!(
+            with_progress("8K HEVC", Some(Place::Resume(754.0))),
+            "Resume 12:34 · 8K HEVC"
+        );
+        assert_eq!(
+            with_progress("Plays well", Some(Place::Watched)),
+            "Watched · Plays well"
+        );
+    }
+
+    #[test]
+    fn rows_carry_progress_markers() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+            writable: false,
+        };
+        nav.show_entries_for_test(server.clone(), &[]);
+        nav.items.push(Item::Video {
+            name: "a.mp4".into(),
+            size: 1,
+            assessment: None,
+            broken: None,
+            modified: 0,
+            layout: None,
+        });
+        let key = crate::library::file_key(&server, "s", &vec!["a.mp4".to_string()]);
+        nav.places.insert(key, Place::Watched);
+        nav.rebuild_rows();
+        assert_eq!(nav.view().rows[0].detail, "Watched · Checking…");
+    }
+
+    fn video(name: &str, size: u64) -> Item {
+        Item::Video {
+            name: name.into(),
+            size,
+            assessment: None,
+            broken: None,
+            modified: 0,
+            layout: None,
+        }
+    }
+
+    fn names(nav: &Navigator) -> Vec<&str> {
+        nav.items.iter().map(Item::name).collect()
+    }
+
+    #[test]
+    fn sort_orders_folders_first_then_by_mode() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+            writable: false,
+        };
+        nav.show_entries_for_test(server.clone(), &["zeta", "alpha"]);
+        nav.items.extend([
+            video("b.mp4", 5),
+            video("a.mp4", 50),
+            video("c.mp4", 20),
+            Item::File {
+                name: "notes.txt".into(),
+                size: 1,
+            },
+        ]);
+        let key = |n: &str| crate::library::file_key(&server, "s", &vec![n.to_string()]);
+        nav.places.insert(key("a.mp4"), Place::Watched);
+        nav.places.insert(key("c.mp4"), Place::Resume(60.0));
+
+        nav.sort = SortMode::Size;
+        nav.sort_items();
+        assert_eq!(
+            names(&nav),
+            ["alpha", "zeta", "a.mp4", "c.mp4", "b.mp4", "notes.txt"]
+        );
+        nav.sort = SortMode::Unwatched;
+        nav.sort_items();
+        assert_eq!(
+            names(&nav),
+            ["alpha", "zeta", "c.mp4", "b.mp4", "a.mp4", "notes.txt"],
+            "started, then unseen, then watched"
+        );
+        nav.sort = SortMode::Name;
+        nav.sort_items();
+        assert_eq!(
+            names(&nav),
+            ["alpha", "zeta", "a.mp4", "b.mp4", "c.mp4", "notes.txt"]
+        );
+    }
+
+    #[test]
+    fn sort_tool_needs_two_videos_and_cycles() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+            writable: false,
+        };
+        nav.show_entries_for_test(server, &[]);
+        nav.items.push(video("a.mp4", 1));
+        nav.rebuild_rows();
+        let labels = |nav: &Navigator| -> Vec<String> {
+            nav.view().tools.iter().map(|t| t.label.clone()).collect()
+        };
+        assert!(!labels(&nav).iter().any(|l| l.starts_with("Sort")));
+        nav.items.push(video("b.mp4", 2));
+        nav.sort = SortMode::Name;
+        nav.rebuild_rows();
+        let labels = labels(&nav);
+        assert!(labels.contains(&"Sort: A-Z".to_string()));
+        assert!(labels.contains(&"Autoplay".to_string()));
+        assert_eq!(SortMode::Name.next().next().next(), SortMode::Name);
+    }
+
+    #[test]
     fn video_extensions() {
         assert!(is_video("clip_180_LR.MP4"));
         assert!(is_video("movie.mkv"));
@@ -1895,8 +2130,14 @@ mod tests {
             Some(4),
             "skips the broken one and the file"
         );
+        nav.autoplay = true;
+        assert!(nav.autoplay_next(), "a video follows the one playing");
+        nav.autoplay = false;
+        assert!(!nav.autoplay_next(), "off: stop at the end");
         nav.playing = Some(4);
+        nav.autoplay = true;
         assert!(!nav.has_adjacent(1));
+        assert!(!nav.autoplay_next(), "the last video has no next");
         nav.playback_ended(None);
         assert!(nav.view().rows[4].outlined, "the video just played");
         assert_eq!(nav.view().rows.iter().filter(|r| r.outlined).count(), 1);
