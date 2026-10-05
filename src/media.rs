@@ -1476,12 +1476,13 @@ pub fn thumbnail_unless(
     let thumb = frame_to_rgba(&frame, crop, out_w, out_h);
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
-        "Timing: thumbnail {name}: open {:.0}, decoder {:.0}, seek {:.0}, decode {:.0}, convert {:.0} ms",
+        "Timing: thumbnail {name}: open {:.0}, decoder {:.0}, seek {:.0}, decode {:.0}, convert {:.0} ms, read {}",
         ms(opened),
         ms(decoder_ready - opened),
         ms(sought - decoder_ready),
         ms(decoded - sought),
         ms(started.elapsed() - decoded),
+        decoder.io(),
     );
     Ok(Some(thumb))
 }
