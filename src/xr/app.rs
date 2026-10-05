@@ -809,7 +809,12 @@ pub fn run(
             set_phase(3);
             let mut failure = None;
             if let Mode::Playing(playback) = std::mem::replace(&mut mode, Mode::Browser) {
-                failure = playback.error.clone();
+                // A read that fails in the last moments is the end of a
+                // video that was watched: nothing to explain.
+                failure = playback
+                    .error
+                    .clone()
+                    .filter(|_| !crate::config::near_end(playback.position(), playback.duration));
                 input.wait_for_dpad_release();
                 timing.report(period);
                 timing.restart();
