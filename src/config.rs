@@ -298,6 +298,9 @@ struct Settings {
     captions: Option<CaptionSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sort: Option<SortMode>,
+    /// Start the next video in the folder when one ends.
+    #[serde(default)]
+    autoplay_next: bool,
 }
 
 /// How a folder's files are ordered (folders always come first, by name).
@@ -324,10 +327,22 @@ impl SortMode {
     pub fn label(self) -> &'static str {
         match self {
             SortMode::Name => "A-Z",
-            SortMode::Size => "Largest",
-            SortMode::Unwatched => "Unwatched",
+            SortMode::Size => "Size",
+            SortMode::Unwatched => "Unseen",
         }
     }
+}
+
+pub fn autoplay_next() -> bool {
+    read_json::<Settings>("settings.json")
+        .map(|s| s.autoplay_next)
+        .unwrap_or(false)
+}
+
+pub fn save_autoplay_next(on: bool) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.autoplay_next = on;
+    write_json("settings.json", &settings, false)
 }
 
 pub fn sort_mode() -> SortMode {

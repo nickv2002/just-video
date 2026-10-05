@@ -107,6 +107,8 @@ enum ToolAction {
     ToggleEdit,
     /// Next sort order.
     CycleSort,
+    /// Start the next video when one ends, or stop.
+    ToggleAutoplay,
     StartSelect,
     CancelSelect,
     DeleteSelected,
@@ -141,6 +143,7 @@ pub struct Navigator {
     /// Progress of the videos played before, by file key (read once per folder).
     places: std::collections::BTreeMap<String, Place>,
     sort: SortMode,
+    autoplay: bool,
     /// The item being played (for previous/next).
     playing: Option<usize>,
     /// Navigation request whose answer we wait for.
@@ -173,6 +176,7 @@ impl Navigator {
             tool_actions: Vec::new(),
             places: Default::default(),
             sort: config::sort_mode(),
+            autoplay: config::autoplay_next(),
             playing: None,
             pending: None,
             pending_changes: HashSet::new(),
@@ -504,6 +508,11 @@ impl Navigator {
         };
         if self.selecting.is_none() && videos >= 2 {
             let label = format!("Sort: {}", self.sort.label());
+            let auto = Tool {
+                active: self.autoplay,
+                ..Tool::text("Autoplay", false)
+            };
+            tools.insert(0, (auto, ToolAction::ToggleAutoplay));
             tools.insert(0, (Tool::text(label, false), ToolAction::CycleSort));
         }
         (self.view.tools, self.tool_actions) = tools.into_iter().unzip();
@@ -742,6 +751,12 @@ impl Navigator {
                 }
                 self.sort_items();
             }
+            Some(ToolAction::ToggleAutoplay) => {
+                self.autoplay = !self.autoplay;
+                if let Err(e) = config::save_autoplay_next(self.autoplay) {
+                    eprintln!("Can't save the autoplay setting: {e:#}");
+                }
+            }
             Some(ToolAction::StartSelect) => self.selecting = Some(HashSet::new()),
             Some(ToolAction::CancelSelect) => self.selecting = None,
             Some(ToolAction::DeleteSelected) => {
@@ -843,6 +858,11 @@ impl Navigator {
             .map(|item| item.trail_name().to_string());
         self.restore_scroll();
         self.rebuild_rows();
+    }
+
+    /// A video ended on its own: should the next one start?
+    pub fn autoplay_next(&self) -> bool {
+        self.autoplay && self.has_adjacent(1)
     }
 
     pub fn has_adjacent(&self, delta: isize) -> bool {
@@ -1387,6 +1407,7 @@ mod tests {
         nav.sort = SortMode::Name;
         nav.rebuild_rows();
         assert_eq!(nav.view().tools[0].label, "Sort: A-Z");
+        assert_eq!(nav.view().tools[1].label, "Autoplay");
         assert_eq!(SortMode::Name.next().next().next(), SortMode::Name);
     }
 
@@ -1505,8 +1526,14 @@ mod tests {
             Some(4),
             "skips the broken one and the file"
         );
+        nav.autoplay = true;
+        assert!(nav.autoplay_next(), "a video follows the one playing");
+        nav.autoplay = false;
+        assert!(!nav.autoplay_next(), "off: stop at the end");
         nav.playing = Some(4);
+        nav.autoplay = true;
         assert!(!nav.has_adjacent(1));
+        assert!(!nav.autoplay_next(), "the last video has no next");
         nav.playback_ended();
         assert!(nav.view().rows[4].outlined, "the video just played");
         assert_eq!(nav.view().rows.iter().filter(|r| r.outlined).count(), 1);

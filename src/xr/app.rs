@@ -743,6 +743,14 @@ pub fn run(
             controls_drawn = None;
         }
         // Leaving playback: B, end of video, or --duration reached.
+        if let Mode::Playing(playback) = &mode
+            && switch_video.is_none()
+            && !buttons.back
+            && playback.finished(now)
+            && navigator.as_ref().is_some_and(|n| n.autoplay_next())
+        {
+            switch_video = Some(1);
+        }
         let mut stop_playback = switch_video.is_some();
         if let Mode::Playing(playback) = &mut mode {
             let reached_end = options
