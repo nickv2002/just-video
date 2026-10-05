@@ -14,7 +14,12 @@ medians or every run. Tools: `just-video bench-seek`, `bench-thumbnails`, `libra
 | SMB: remember a name lookup (10 min), look saved servers up at start | cold connect + listing: 1159 ms | 431 ms |
 | Open: subtitle lookup can't hold the video back (0.5 s grace) | a stalled listing delayed the first frame by 15 s (seen once) | at most +0.5 s |
 | Browser repaint: rounded rectangles write their interior directly | 9.5-10.9 ms per repaint (30 rows with thumbnails, Frame) | 0.7-1.9 ms; output bit-identical |
-| `mallopt(M_TRIM_THRESHOLD)` at start | thumbnails: 257-286 MB resident after, 287-330 MB peak | 30-32 MB after, 61-75 MB peak |
+| `mallopt(M_TRIM_THRESHOLD)` at start (`JUST_VIDEO_NO_TRIM=1` turns it off) | thumbnails: 257-286 MB resident after, 287-330 MB peak | 30-32 MB after, 61-75 MB peak |
+| Browser repaints into the previous canvas | with trimming on, a fresh 6.4 MB canvas per repaint cost 2.0-3.0 ms (page faults) | 0.65-1.7 ms, same as without trimming |
+
+Trimming makes every allocation of 128 KiB or more a fresh mapping, so a per-frame buffer of
+that size must be reused (the browser canvas is; the controls panel, 1.2 MB, repaints about once
+a second and was left alone). 8K software playback showed no difference with or without it.
 
 ## Findings worth knowing
 

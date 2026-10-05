@@ -373,6 +373,34 @@ mod tests {
         }
     }
 
+    /// The cases the browser draws most: whole-pixel bounds, square corners
+    /// (the cover bars), the row radius, and rectangles past the canvas edge.
+    #[test]
+    fn rect_matches_the_reference_on_whole_pixel_bounds() {
+        let cases = [
+            (0.0, 0.0, 100.0, 12.0, 0.0),
+            (0.0, 68.0, 100.0, 40.0, 0.0),
+            (4.0, 10.0, 90.0, 30.0, 14.0),
+            (4.0, 10.0, 90.0, 30.0, 15.0),
+            (10.0, 10.0, 30.0, 30.0, 15.0),
+            (10.0, 10.0, 1.0, 1.0, 0.0),
+            (10.0, 10.0, 2.0, 40.0, 1.0),
+            (-5.0, -5.0, 120.0, 100.0, 14.0),
+            (50.5, 20.5, 20.0, 20.0, 3.0),
+        ];
+        for (x, y, w, h, r) in cases {
+            let (mut a, mut b) = (Canvas::new(100, 80), Canvas::new(100, 80));
+            a.clear([20, 30, 40]);
+            b.clear([20, 30, 40]);
+            a.rect(x, y, w, h, r, [200, 100, 50]);
+            reference_rect(&mut b, x, y, w, h, r, [200, 100, 50]);
+            assert!(
+                a.pixels == b.pixels,
+                "rect({x}, {y}, {w}, {h}, r {r}) differs"
+            );
+        }
+    }
+
     #[test]
     fn rect_matches_the_per_pixel_reference() {
         // A small deterministic generator: no new dependencies.
