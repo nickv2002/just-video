@@ -75,16 +75,24 @@ fn write_file(name: &str, bytes: &[u8], private: bool) -> anyhow::Result<()> {
     let dir = dir()?;
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    let tmp = dir.join(format!(".{name}.tmp"));
-    let _ = std::fs::remove_file(&tmp);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(if private { 0o600 } else { 0o644 })
-        .open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, dir.join(name))?;
+    // A name of its own: two writers of one file (a background save and the
+    // UI's) must not delete each other's half-written file or fail.
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(if private { 0o600 } else { 0o644 })
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, dir.join(name))
+    };
+    write().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
     Ok(())
 }
 
@@ -477,6 +485,20 @@ mod tests {
         let p = preferences();
         assert_eq!((p.long_jump, p.volume_step), (600, 20));
         assert_eq!(caption_settings().scale, 1.5);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_leaves_only_the_file() {
+        let dir = temp_config("write-clean");
+        for n in 0..3 {
+            update_preferences(|p| p.long_jump = 30 + n).unwrap();
+        }
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["settings.json"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
