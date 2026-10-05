@@ -7,7 +7,8 @@
 
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, format_size};
 use super::form::{self, Field, Form, Key};
-use crate::config::{self, Server};
+use super::controls::format_time;
+use crate::config::{self, Place, Server};
 use crate::library::{Library, Opened, Path, Request, Response};
 use crate::playability::{Assessment, Verdict};
 use crate::smb::SmbUrl;
@@ -18,6 +19,15 @@ const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mkv", "mov", "webm", "avi", "
 pub fn is_video(name: &str) -> bool {
     name.rsplit_once('.')
         .is_some_and(|(_, ext)| VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// A row's detail line with where the viewer left off: "Resume 12:34 · title".
+fn with_progress(detail: &str, place: Option<Place>) -> String {
+    match place {
+        Some(Place::Resume(seconds)) => format!("Resume {} · {detail}", format_time(seconds)),
+        Some(Place::Watched) => format!("Watched · {detail}"),
+        None => detail.to_string(),
+    }
 }
 
 /// Names from the top down to a place: server URL, share, folders.
@@ -126,6 +136,8 @@ pub struct Navigator {
     edit_mode: bool,
     /// What each header tool does.
     tool_actions: Vec<ToolAction>,
+    /// Progress of the videos played before, by file key (read once per folder).
+    places: std::collections::BTreeMap<String, Place>,
     /// The item being played (for previous/next).
     playing: Option<usize>,
     /// Navigation request whose answer we wait for.
@@ -156,6 +168,7 @@ impl Navigator {
             selecting: None,
             edit_mode: false,
             tool_actions: Vec::new(),
+            places: Default::default(),
             playing: None,
             pending: None,
             pending_changes: HashSet::new(),
@@ -335,6 +348,23 @@ impl Navigator {
         self.view.scroll = scroll;
     }
 
+    /// Progress marker of the video `name` in the open folder.
+    fn place_of(&self, name: &str) -> Option<Place> {
+        let Location::Folder {
+            server,
+            share,
+            path,
+        } = &self.location
+        else {
+            return None;
+        };
+        let mut file = path.clone();
+        file.push(name.to_string());
+        self.places
+            .get(&crate::library::file_key(server, share, &file))
+            .copied()
+    }
+
     fn rebuild_rows(&mut self) {
         let editing = self.editing();
         let selecting = self.selecting.as_ref();
@@ -376,8 +406,10 @@ impl Navigator {
                         },
                         detail: match (assessment, broken) {
                             (_, Some(_)) => "Can't read this file".into(),
-                            (Some(a), None) => a.title.clone(),
-                            (None, None) => "Checking…".into(),
+                            (Some(a), None) => {
+                                with_progress(&a.title, self.place_of(name))
+                            }
+                            (None, None) => with_progress("Checking…", self.place_of(name)),
                         },
                         right: format_size(*size),
                         ..Row::new(Icon::Video(None), name)
@@ -467,6 +499,7 @@ impl Navigator {
                     };
                     match result {
                         Ok(entries) => {
+                            self.places = config::places();
                             self.items = entries
                                 .into_iter()
                                 .filter(|e| !e.name.starts_with('.'))
@@ -738,6 +771,7 @@ impl Navigator {
 
     /// Back from playing: outlines the video that played, and keeps it in view.
     pub fn playback_ended(&mut self) {
+        self.places = config::places();
         self.came_from = self
             .playing
             .and_then(|i| self.items.get(i))
@@ -1184,6 +1218,39 @@ impl Navigator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_shows_in_the_detail_line() {
+        assert_eq!(with_progress("8K HEVC", None), "8K HEVC");
+        assert_eq!(
+            with_progress("8K HEVC", Some(Place::Resume(754.0))),
+            "Resume 12:34 · 8K HEVC"
+        );
+        assert_eq!(
+            with_progress("Plays well", Some(Place::Watched)),
+            "Watched · Plays well"
+        );
+    }
+
+    #[test]
+    fn rows_carry_progress_markers() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+        };
+        nav.show_entries_for_test(server.clone(), &[]);
+        nav.items.push(Item::Video {
+            name: "a.mp4".into(),
+            size: 1,
+            assessment: None,
+            broken: None,
+        });
+        let key = crate::library::file_key(&server, "s", &vec!["a.mp4".to_string()]);
+        nav.places.insert(key, Place::Watched);
+        nav.rebuild_rows();
+        assert_eq!(nav.view().rows[0].detail, "Watched · Checking…");
+    }
 
     #[test]
     fn video_extensions() {

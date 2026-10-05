@@ -294,11 +294,11 @@ fn save_layout(
 /// write may be slow).
 fn save_resume(key: Option<&String>, playback: &Playback) {
     let Some(key) = key.cloned() else { return };
-    let point = crate::config::resume_point(playback.position(), playback.duration);
+    let (position, duration) = (playback.position(), playback.duration);
     let _ = std::thread::Builder::new()
         .name("save resume".into())
         .spawn(move || {
-            if let Err(e) = crate::config::save_resume_position(&key, point) {
+            if let Err(e) = crate::config::save_stop(&key, position, duration) {
                 eprintln!("Can't save where the video was left: {e:#}");
             }
         });
@@ -1440,9 +1440,9 @@ pub fn run(
     options.quit.store(true, Ordering::Relaxed);
     if let Mode::Playing(playback) = mode {
         // Written here, not in the background: the app is about to exit.
-        let point = crate::config::resume_point(playback.position(), playback.duration);
         if let Some(key) = &playing_key
-            && let Err(e) = crate::config::save_resume_position(key, point)
+            && let Err(e) =
+                crate::config::save_stop(key, playback.position(), playback.duration)
         {
             eprintln!("Can't save where the video was left: {e:#}");
         }
