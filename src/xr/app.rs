@@ -1383,12 +1383,17 @@ pub fn run(
                 if buttons.volume != 0 {
                     system_volume.step(buttons.volume * prefs.volume_step.clamp(1, 50) as i32);
                 }
+                // SteamOS shows the new level itself: a notice only says what
+                // its overlay can't (no sound in this video, no volume control).
                 if let Some(level) = system_volume.take_changed() {
-                    let mut text = level.notice();
-                    if !playback.has_audio() {
-                        text += " (this video has no sound)";
+                    let text = match level {
+                        crate::system_volume::Level::Unavailable => Some(level.notice()),
+                        _ if !playback.has_audio() => Some("This video has no sound".into()),
+                        _ => None,
+                    };
+                    if let Some(text) = text {
+                        playback.notice(text, NOTICE);
                     }
-                    playback.notice(text, NOTICE);
                 }
                 if buttons.reset {
                     placement = Placement {
@@ -1699,7 +1704,7 @@ fn pointer_moved(now: Option<(f32, f32)>, then: Option<(f32, f32)>) -> bool {
     }
 }
 
-/// How long a jump or volume notice stays up.
+/// How long a jump notice stays up.
 const NOTICE: Duration = Duration::from_millis(1500);
 
 /// "+5 s · 12:34" after a jump of `jump` seconds to `position`.
