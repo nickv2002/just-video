@@ -849,6 +849,34 @@ fn dispatch_probes(
     }
 }
 
+/// Runs `attempt` on a connection from `connect`; if that connection turns
+/// out to be dead (`connection_lost`: the server dropped it while the headset
+/// slept, say), drops it and tries once more on a fresh one. Only then is the
+/// error the file's: a dead connection must not mark good files as damaged.
+fn retry_on_lost_connection<S, T>(
+    mut connect: impl FnMut() -> Result<S, String>,
+    mut drop_connection: impl FnMut(&S),
+    mut attempt: impl FnMut(&S) -> Option<Result<T, String>>,
+) -> Option<Result<T, String>> {
+    let mut retried = false;
+    loop {
+        let session = match connect() {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
+        match attempt(&session) {
+            Some(Err(e)) if connection_lost(&e) => {
+                drop_connection(&session);
+                if retried {
+                    return Some(Err(e));
+                }
+                retried = true;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Reads one video's header. `None` when the probe stopped for playback or
 /// because its folder was left (it is queued again, and dropped if stale).
 fn probe(
@@ -864,10 +892,6 @@ fn probe(
         blocks_ahead: 4,
     };
     let name = job.path.last().cloned().unwrap_or_default();
-    let session = match session(sessions, &job.server, Purpose::Probe) {
-        Ok(s) => s,
-        Err(e) => return Some(Err(e)),
-    };
     let generation = job.generation;
     let stop = || video_busy(opening) || current.load(Ordering::Relaxed) != generation;
     // The reads give up the moment a video starts or the folder is left, also
@@ -876,27 +900,28 @@ fn probe(
         let (opening, current) = (opening.clone(), current.clone());
         Arc::new(move || video_busy(&opening) || current.load(Ordering::Relaxed) != generation)
     };
-    let result = session
-        .open_in(&job.share, &smb_path(&job.path), small)
-        .map_err(err)
-        .and_then(|reader| Media::open(&name, reader.with_cancel(cancel)).map_err(err))
-        .map(|media| media.info().video.clone());
-    // Stopped by `cancel` (FFmpeg only sees a read error, and might even
-    // succeed with what it read): not a result.
-    if stop() {
-        return None;
-    }
-    match result {
-        Err(e) => {
-            // A bad file is not a connection problem; a stalled server is.
-            if connection_lost(&e) {
-                eprintln!("Library: probe of {name} failed: {e}");
-                evict(sessions, &job.server, Purpose::Probe, Some(&session));
+    retry_on_lost_connection(
+        || session(sessions, &job.server, Purpose::Probe),
+        |failed| {
+            eprintln!("Library: probe of {name} lost its connection");
+            evict(sessions, &job.server, Purpose::Probe, Some(failed));
+        },
+        |session| {
+            let result = session
+                .open_in(&job.share, &smb_path(&job.path), small)
+                .map_err(err)
+                .and_then(|reader| {
+                    Media::open(&name, reader.with_cancel(cancel.clone())).map_err(err)
+                })
+                .map(|media| media.info().video.clone());
+            // Stopped by `cancel` (FFmpeg only sees a read error, and might
+            // even succeed with what it read): not a result.
+            if stop() {
+                return None;
             }
-            Some(Err(e))
-        }
-        ok => Some(ok),
-    }
+            Some(result)
+        },
+    )
 }
 
 /// Pending thumbnails for the folder on screen, nearest the view first.
@@ -1037,7 +1062,6 @@ fn make_thumbnail(
     let generation = queue.generation;
     let mut path = folder.clone();
     path.push(video.name.clone());
-    let session = session(sessions, server, Purpose::Thumbnail)?;
     let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop = || video_busy(opening) || current.load(Ordering::Relaxed) != generation;
     // The reads give up the moment a video starts or the folder is left, also
@@ -1052,34 +1076,40 @@ fn make_thumbnail(
             current.load(Ordering::Relaxed) != generation
         })
     };
-    let result = session
-        .open_in(share, &smb_path(&path), THUMB_READ_AHEAD)
-        .map_err(|e| format!("{e:#}"))
-        .and_then(|reader| {
-            let reader = reader
-                .with_cancel(cancel.clone())
-                .with_max_in_flight(THUMB_IN_FLIGHT);
-            crate::media::thumbnail_unless(
-                &video.name,
-                reader,
-                THUMB_AT,
-                &video.layout,
-                THUMB_W,
-                THUMB_H,
-                &stop,
-            )
-            .map_err(|e| format!("{e:#}"))
-        });
-    // Stopped by `cancel` (FFmpeg only sees a read error): not a failure.
-    if paused.load(Ordering::SeqCst) || result.is_err() && stop() {
-        return Ok(None);
+    let result = retry_on_lost_connection(
+        || session(sessions, server, Purpose::Thumbnail),
+        |failed| evict(sessions, server, Purpose::Thumbnail, Some(failed)),
+        |session| {
+            paused.store(false, Ordering::SeqCst);
+            let result = session
+                .open_in(share, &smb_path(&path), THUMB_READ_AHEAD)
+                .map_err(|e| format!("{e:#}"))
+                .and_then(|reader| {
+                    let reader = reader
+                        .with_cancel(cancel.clone())
+                        .with_max_in_flight(THUMB_IN_FLIGHT);
+                    crate::media::thumbnail_unless(
+                        &video.name,
+                        reader,
+                        THUMB_AT,
+                        &video.layout,
+                        THUMB_W,
+                        THUMB_H,
+                        &stop,
+                    )
+                    .map_err(|e| format!("{e:#}"))
+                });
+            // Stopped by `cancel` (FFmpeg only sees a read error): not a failure.
+            if paused.load(Ordering::SeqCst) || result.is_err() && stop() {
+                return None;
+            }
+            Some(result)
+        },
+    );
+    match result {
+        None => Ok(None),
+        Some(result) => result,
     }
-    if let Err(e) = &result
-        && connection_lost(e)
-    {
-        evict(sessions, server, Purpose::Thumbnail, Some(&session));
-    }
-    result
 }
 
 /// The thumbnail worker: serves disk cache hits as soon as they are asked
@@ -1598,6 +1628,39 @@ mod tests {
         a.layout.swap_eyes = true;
         queue.apply(thumb_folder(1, vec![a], 0), 1);
         assert_eq!(queue.pending.len(), 3);
+    }
+
+    #[test]
+    fn a_dead_connection_is_replaced_once_before_a_file_gets_the_blame() {
+        let lost = "IO Error: Connection reset by peer (os error 104)";
+        let run = |results: Vec<Option<Result<u32, String>>>| {
+            let (mut connects, mut drops) = (0, 0);
+            let mut results = results.into_iter();
+            let got = retry_on_lost_connection(
+                || {
+                    connects += 1;
+                    Ok(connects)
+                },
+                |_| drops += 1,
+                |_| results.next().expect("attempt"),
+            );
+            (got, connects, drops)
+        };
+        // The retry on a fresh connection works: the file is fine.
+        let (got, connects, drops) = run(vec![Some(Err(lost.into())), Some(Ok(7))]);
+        assert_eq!(got, Some(Ok(7)));
+        assert_eq!((connects, drops), (2, 1));
+        // Still lost: the error is reported, after one retry only.
+        let (got, connects, drops) = run(vec![Some(Err(lost.into())), Some(Err(lost.into()))]);
+        assert_eq!(got, Some(Err(lost.to_string())));
+        assert_eq!((connects, drops), (2, 2));
+        // A bad file is not a connection problem; a stopped job is not a result.
+        let bad = "Invalid data found when processing input";
+        let (got, connects, drops) = run(vec![Some(Err(bad.into()))]);
+        assert_eq!(got, Some(Err(bad.to_string())));
+        assert_eq!((connects, drops), (1, 0));
+        let (got, _, drops) = run(vec![None]);
+        assert_eq!((got, drops), (None, 0));
     }
 
     #[test]
