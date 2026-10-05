@@ -88,6 +88,20 @@ impl FromStr for SmbUrl {
 }
 
 impl SmbUrl {
+    /// Looks the server's name up now (off the caller's thread), so the first
+    /// connection to it doesn't wait for it: an mDNS lookup takes 350-400 ms.
+    pub fn prefetch_address(&self) {
+        let host = self.server();
+        let _ = std::thread::Builder::new()
+            .name("resolve".into())
+            .spawn(move || smb::transport::utils::TransportUtils::prefetch(&host));
+    }
+
+    /// Forgets the server's remembered address: a connection to it failed.
+    pub fn forget_address(&self) {
+        smb::transport::utils::TransportUtils::forget(&self.server());
+    }
+
     fn server(&self) -> String {
         match self.port {
             Some(port) => format!("{}:{port}", self.host),

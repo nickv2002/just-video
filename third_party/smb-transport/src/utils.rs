@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct TransportUtils;
 use crate::TransportError;
+
+type Resolved = Mutex<Option<HashMap<String, (SocketAddr, Option<Instant>)>>>;
+/// Answers of host-name lookups, by `host:port` as passed to `to_socket_addrs`.
+static RESOLVED: Resolved = Mutex::new(None);
 
 impl TransportUtils {
     /// Parses a string endpoint into a [SocketAddr]. If no port is specified, port 0 is used.
@@ -50,27 +54,65 @@ impl TransportUtils {
 
     /// Resolves a host name, retrying: mDNS names (`nas.local`) sometimes fail
     /// to resolve for a moment on a busy Wi-Fi link. If it still fails, the
-    /// address that last worked for the name in this process is used.
+    /// address that last worked for the name in this process is used. An
+    /// answer is also reused for ten minutes (until [`TransportUtils::forget`])
+    /// without asking again: an mDNS lookup takes 350-400 ms on the Frame
+    /// (more, or nothing, when it is busy), and one connection asks twice.
     fn resolve(
         endpoint: &str,
         lookup: impl Fn(&str) -> Option<SocketAddr>,
     ) -> Option<SocketAddr> {
-        static RESOLVED: Mutex<Option<HashMap<String, SocketAddr>>> = Mutex::new(None);
+        Self::resolve_within(endpoint, lookup, Duration::from_secs(600))
+    }
+
+    fn resolve_within(
+        endpoint: &str,
+        lookup: impl Fn(&str) -> Option<SocketAddr>,
+        fresh: Duration,
+    ) -> Option<SocketAddr> {
         const ATTEMPTS: u32 = 3;
+        let known = || RESOLVED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((address, at)) = known().as_ref().and_then(|m| m.get(endpoint)).copied()
+            && at.is_some_and(|at| at.elapsed() < fresh)
+        {
+            return Some(address);
+        }
         for attempt in 1..=ATTEMPTS {
             if let Some(address) = lookup(endpoint) {
-                let mut known = RESOLVED.lock().unwrap_or_else(|e| e.into_inner());
-                known
+                known()
                     .get_or_insert_with(HashMap::new)
-                    .insert(endpoint.to_owned(), address);
+                    .insert(endpoint.to_owned(), (address, Some(Instant::now())));
                 return Some(address);
             }
             if attempt < ATTEMPTS {
                 std::thread::sleep(Duration::from_millis(100 * attempt as u64));
             }
         }
-        let known = RESOLVED.lock().unwrap_or_else(|e| e.into_inner());
-        known.as_ref()?.get(endpoint).copied()
+        known().as_ref()?.get(endpoint).map(|(address, _)| *address)
+    }
+
+    /// Stops trusting what is remembered for `host` (with or without a port),
+    /// e.g. after a connection to it failed: the next lookup asks again. The
+    /// old address stays as the answer if that lookup fails.
+    pub fn forget(host: &str) {
+        let has_port = host
+            .rsplit_once(':')
+            .is_some_and(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+        let key = if has_port {
+            host.to_owned()
+        } else {
+            format!("{host}:0")
+        };
+        let mut known = RESOLVED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = known.as_mut().and_then(|m| m.get_mut(&key)) {
+            entry.1 = None;
+        }
+    }
+
+    /// Resolves `host` (with or without a port) ahead of the first connection,
+    /// so that one doesn't wait for the lookup. Failures are ignored.
+    pub fn prefetch(host: &str) {
+        let _ = Self::parse_socket_address(host);
     }
 }
 
@@ -89,8 +131,9 @@ mod tests {
             calls.set(calls.get() + 1);
             (calls.get() > 1).then_some(address)
         };
+        let never_fresh = Duration::ZERO;
         assert_eq!(
-            TransportUtils::resolve("flaky-nas.local:445", flaky),
+            TransportUtils::resolve_within("flaky-nas.local:445", flaky, never_fresh),
             Some(address)
         );
         assert_eq!(calls.get(), 2);
@@ -101,12 +144,34 @@ mod tests {
             None
         };
         assert_eq!(
-            TransportUtils::resolve("flaky-nas.local:445", down),
+            TransportUtils::resolve_within("flaky-nas.local:445", down, never_fresh),
             Some(address)
         );
         assert_eq!(calls.get(), 3);
         // Never resolved: nothing.
         assert_eq!(TransportUtils::resolve("never.local:445", |_| None), None);
+    }
+
+    #[test]
+    fn a_fresh_answer_is_not_asked_for_again() {
+        use std::cell::Cell;
+        let address: SocketAddr = "10.0.0.6:445".parse().unwrap();
+        let calls = Cell::new(0);
+        let lookup = |_: &str| {
+            calls.set(calls.get() + 1);
+            Some(address)
+        };
+        let minute = Duration::from_secs(60);
+        for _ in 0..3 {
+            assert_eq!(
+                TransportUtils::resolve_within("fresh-nas.local:445", lookup, minute),
+                Some(address)
+            );
+        }
+        assert_eq!(calls.get(), 1);
+        // Too old to trust: asked again.
+        TransportUtils::resolve_within("fresh-nas.local:445", lookup, Duration::ZERO);
+        assert_eq!(calls.get(), 2);
     }
 
     fn parse(endpoint: &str) -> SocketAddr {

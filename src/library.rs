@@ -525,9 +525,14 @@ fn connect_to(
             .map_err(|e| format!("{e:#}"))?
             .unwrap_or_default(),
     };
-    Ok(Arc::new(SmbSession::connect(url, password).map_err(
-        |e| format!("Can't connect to {}: {e:#}", server.name),
-    )?))
+    match SmbSession::connect(url.clone(), password) {
+        Ok(session) => Ok(Arc::new(session)),
+        Err(e) => {
+            // The server may have moved to another address.
+            url.forget_address();
+            Err(format!("Can't connect to {}: {e:#}", server.name))
+        }
+    }
 }
 
 fn session(
@@ -1324,6 +1329,12 @@ impl Library {
         let cache = Arc::new(Mutex::new(ProbeCache::default()));
         let standby: Arc<Mutex<Option<Standby>>> = Default::default();
         let (response_tx, responses) = mpsc::channel();
+        // The saved servers' names resolve while the list is on screen.
+        for server in config::servers().unwrap_or_default() {
+            if let Ok(url) = server.url.parse::<SmbUrl>() {
+                url.prefetch_address();
+            }
+        }
 
         let (warmer, rx) = mpsc::channel::<(Request, std::time::Instant)>();
         {
