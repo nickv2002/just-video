@@ -16,6 +16,8 @@ use std::{
 };
 use tokio::{runtime::Runtime, task::JoinHandle};
 
+use crate::read_metrics::{self, ReadMetrics};
+
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Random-access byte source, e.g. an open SMB file.
@@ -55,6 +57,48 @@ pub struct ReadStats {
     pub stall_seconds: f64,
     pub discarded_blocks: u64,
 }
+
+/// How the buffer sizes itself (see [`ReadAheadReader::with_adaptive`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Adaptive {
+    /// Seconds of the stream to keep buffered ahead.
+    pub seconds: f64,
+    /// The buffer never aims below or above this many bytes.
+    pub min_bytes: usize,
+    pub max_bytes: usize,
+    /// Most reads in flight at a time once the buffer has grown.
+    pub in_flight: usize,
+}
+
+impl Default for Adaptive {
+    fn default() -> Self {
+        Self {
+            seconds: ADAPTIVE_SECONDS,
+            min_bytes: 16 << 20,
+            max_bytes: ADAPTIVE_MAX_BYTES,
+            in_flight: ADAPTIVE_IN_FLIGHT,
+        }
+    }
+}
+
+/// Seconds ahead to buffer: Wi-Fi stalls of 1-3 s were seen on the headset,
+/// and 10 s ride out several in a row while the link refills the buffer.
+const ADAPTIVE_SECONDS: f64 = 10.0;
+/// Memory cap of the buffer ahead (8K60 HEVC at ~13 MiB/s: ~130 MiB).
+const ADAPTIVE_MAX_BYTES: usize = 160 << 20;
+/// Same as `MAX_IN_FLIGHT`: over the headset's link 3, 4, 6 and 8 in flight
+/// carried the same (medians 201, 217, 202, 209 Mbit/s over 4 connections,
+/// noise ~15 %) while each request's latency grew with the count, and a read
+/// can't be taken back when the reader is left or jumps (4 in flight at once
+/// after a jump measured ~10 % slower jumps, 4 runs each).
+const ADAPTIVE_IN_FLIGHT: usize = 3;
+/// A read waiting this long for its block counts as a stall.
+const STALL_SEEN: Duration = Duration::from_millis(150);
+/// Each stall seen in steady reading makes the buffer this much larger…
+const STALL_GROWTH: f64 = 1.5;
+/// …up to this factor, shrinking back by half this often.
+const BOOST_MAX: f64 = 3.0;
+const BOOST_HALF_LIFE: Duration = Duration::from_secs(60);
 
 enum Block {
     Pending(JoinHandle<io::Result<Vec<u8>>>),
@@ -114,6 +158,18 @@ pub struct ReadAheadReader<S: BlockSource> {
     /// dropping does not wait for those in flight.
     cancelled: bool,
     max_in_flight: usize,
+    metrics: Arc<ReadMetrics>,
+    /// Registered as the playing video's reader (see `for_playback`).
+    playback: bool,
+    adaptive: Option<Adaptive>,
+    /// Stalls seen in steady reading make the buffer larger (1.0-`BOOST_MAX`).
+    boost: f64,
+    boost_at: Instant,
+    /// Blocks aimed at ahead, as of the last read (see `target_blocks`).
+    target: usize,
+    /// Bytes read and since when, for the rate when the stream's is unknown.
+    measured: (Instant, u64),
+    measured_rate: f64,
 }
 
 /// See [`ReadAheadReader::with_cancel`].
@@ -141,7 +197,37 @@ impl<S: BlockSource> ReadAheadReader<S> {
             cancel: None,
             cancelled: false,
             max_in_flight: MAX_IN_FLIGHT,
+            metrics: Arc::new(ReadMetrics::default()),
+            playback: false,
+            adaptive: None,
+            boost: 1.0,
+            boost_at: Instant::now(),
+            target: options.blocks_ahead,
+            measured: (Instant::now(), 0),
+            measured_rate: 0.0,
         }
+    }
+
+    /// Sizes the buffer by time instead of a count of blocks: it aims to
+    /// hold `adaptive.seconds` of the stream ahead (from its bytes per
+    /// second, see [`ReadMetrics::set_rate_hint`]), within the byte limits,
+    /// larger after stalls, and allows more reads in flight once it has grown
+    /// (after a jump it starts small again, see `INITIAL_WINDOW`).
+    pub fn with_adaptive(mut self, adaptive: Adaptive) -> Self {
+        self.adaptive = Some(adaptive);
+        self
+    }
+
+    /// Makes this the reader the timing log reports on (see
+    /// [`read_metrics::playback_metrics`]).
+    pub fn for_playback(mut self) -> Self {
+        self.playback = true;
+        read_metrics::register_playback(&self.metrics);
+        self
+    }
+
+    pub fn metrics(&self) -> Arc<ReadMetrics> {
+        self.metrics.clone()
     }
 
     /// Reads fail with `ErrorKind::Interrupted` as soon as `cancel` says so,
@@ -172,6 +258,56 @@ impl<S: BlockSource> ReadAheadReader<S> {
         self.stats
     }
 
+    /// Blocks to aim to hold ahead: the policy's fixed count, or, with
+    /// [`ReadAheadReader::with_adaptive`], the time wanted at the stream's
+    /// rate (its own if known, else what the reader sees consumed).
+    fn target_blocks(&mut self) -> usize {
+        let Some(a) = self.adaptive else {
+            return self.options.blocks_ahead;
+        };
+        let (since, bytes) = self.measured;
+        if since.elapsed() >= Duration::from_secs(2) {
+            let sample = bytes as f64 / since.elapsed().as_secs_f64();
+            // Quick to rise, slow to fall: a stall must not shrink the buffer.
+            self.measured_rate = sample.max(self.measured_rate * 0.9);
+            self.measured = (Instant::now(), 0);
+        }
+        if self.boost > 1.0 && self.boost_at.elapsed() >= BOOST_HALF_LIFE {
+            self.boost = 1.0 + (self.boost - 1.0) / 2.0;
+            self.boost_at = Instant::now();
+        }
+        let hint = self.metrics.rate_hint() as f64;
+        let rate = if hint > 0.0 { hint } else { self.measured_rate };
+        let wanted = (rate * a.seconds * self.boost) as usize;
+        wanted
+            .clamp(a.min_bytes, a.max_bytes.max(a.min_bytes))
+            .div_ceil(self.options.block_size)
+            .max(1)
+    }
+
+    /// A read waited for data. In steady reading (the window has grown to
+    /// what is wanted) that means the buffer was too small.
+    fn note_stall(&mut self) {
+        if self.adaptive.is_some() && self.window >= self.target {
+            self.boost = (self.boost * STALL_GROWTH).min(BOOST_MAX);
+            self.boost_at = Instant::now();
+        }
+    }
+
+    /// Finished bytes waiting from block `current` on.
+    fn ahead_bytes(&self, current: u64) -> u64 {
+        self.blocks
+            .range(current..)
+            .filter(|(_, b)| match b {
+                Block::Ready(_) => true,
+                Block::Pending(h) => h.is_finished(),
+            })
+            .map(|(&i, _)| {
+                (self.options.block_size as u64).min(self.len - i * self.options.block_size as u64)
+            })
+            .sum()
+    }
+
     fn kept_blocks(&self) -> usize {
         (KEPT_BYTES / self.options.block_size).max(1)
     }
@@ -190,24 +326,36 @@ impl<S: BlockSource> ReadAheadReader<S> {
         let fetch = self.source.clone().fetch(offset, length);
         let in_flight = self.in_flight.clone();
         in_flight.fetch_add(1, Ordering::SeqCst);
+        let metrics = self.metrics.clone();
+        let requested = Instant::now();
         let task = self.runtime.spawn(async move {
             let result = fetch.await;
+            metrics.request_done(requested.elapsed());
             in_flight.fetch_sub(1, Ordering::SeqCst);
             result
         });
         self.blocks.insert(index, Block::Pending(task));
     }
 
+    fn in_flight_cap(&self) -> usize {
+        match self.adaptive {
+            Some(a) => a.in_flight.max(1),
+            None => self.max_in_flight,
+        }
+    }
+
     /// Keeps `[current, current + window)` requested and drops the rest,
     /// except one block behind, which absorbs small backward seeks by demuxers.
     fn schedule(&mut self, current: u64) {
+        let target = self.target_blocks();
+        self.target = target;
         self.window = next_window(
             self.window,
             self.last_index,
             current,
             // Kept from before counts: the reader came back to it.
             self.blocks.contains_key(&current) || self.cache.iter().any(|(i, _)| *i == current),
-            self.options.blocks_ahead,
+            target,
         );
         self.last_index = Some(current);
         let block_count = self.len.div_ceil(self.options.block_size as u64);
@@ -215,7 +363,7 @@ impl<S: BlockSource> ReadAheadReader<S> {
         let keep_from = current.saturating_sub(1);
         // Only blocks beyond the full window are dropped ahead: a window that
         // is still growing keeps what it already asked for.
-        let keep_until = (current + self.options.blocks_ahead as u64).min(block_count);
+        let keep_until = (current + target.max(self.window) as u64).min(block_count);
         let stale: Vec<u64> = self
             .blocks
             .keys()
@@ -238,9 +386,14 @@ impl<S: BlockSource> ReadAheadReader<S> {
         self.detached.retain(|h| !h.is_finished());
         // Detached reads count against the window, so seeking around cannot
         // pile up requests; the block needed now is always requested.
+        self.metrics.sample(
+            self.in_flight.load(Ordering::SeqCst),
+            self.ahead_bytes(current),
+            (target * self.options.block_size) as u64,
+        );
         for index in current..end {
             if !self.blocks.contains_key(&index) {
-                let limit = self.window.min(self.max_in_flight);
+                let limit = self.window.min(self.in_flight_cap());
                 if index != current && self.in_flight.load(Ordering::SeqCst) >= limit {
                     break;
                 }
@@ -349,6 +502,9 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
                 }
             }
         }
+        if waited >= STALL_SEEN {
+            self.note_stall();
+        }
         let block = self.blocks.get_mut(&index).expect("scheduled block");
         let Block::Ready(data) = block else {
             unreachable!()
@@ -358,6 +514,7 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
         out[..n].copy_from_slice(&data[start..start + n]);
         self.pos += n as u64;
         self.stats.bytes_delivered += n as u64;
+        self.measured.1 += n as u64;
         Ok(n)
     }
 }
@@ -376,6 +533,9 @@ impl<S: BlockSource> Seek for ReadAheadReader<S> {
 
 impl<S: BlockSource> Drop for ReadAheadReader<S> {
     fn drop(&mut self) {
+        if self.playback {
+            read_metrics::unregister_playback(&self.metrics);
+        }
         let runtime = self.runtime.clone();
         // Sources may spawn cleanup work on drop (smb-rs does).
         let _guard = runtime.enter();
@@ -773,5 +933,166 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(elapsed < Duration::from_millis(400), "took {elapsed:?}");
         assert_eq!(r.stats().requests, 64);
+    }
+
+    /// 5 ms per request, except blocks `spike` which take `spike_for`: a
+    /// Wi-Fi stall that holds some requests back.
+    struct Spiky {
+        data: Vec<u8>,
+        block: usize,
+        spike: std::ops::Range<usize>,
+        spike_for: Duration,
+    }
+
+    impl BlockSource for Spiky {
+        fn fetch(
+            self: Arc<Self>,
+            offset: u64,
+            len: usize,
+        ) -> BoxFuture<'static, io::Result<Vec<u8>>> {
+            Box::pin(async move {
+                let index = offset as usize / self.block;
+                let wait = if self.spike.contains(&index) {
+                    self.spike_for
+                } else {
+                    Duration::from_millis(5)
+                };
+                tokio::time::sleep(wait).await;
+                Ok(self.data[offset as usize..offset as usize + len].to_vec())
+            })
+        }
+    }
+
+    const BLOCK: usize = 1000;
+
+    fn spiky_reader(blocks: usize, spike: std::ops::Range<usize>) -> ReadAheadReader<Spiky> {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_time()
+                .build()
+                .unwrap(),
+        );
+        let source = Spiky {
+            data: (0..blocks * BLOCK).map(|i| (i % 251) as u8).collect(),
+            block: BLOCK,
+            spike,
+            spike_for: Duration::from_millis(1000),
+        };
+        let options = ReadAhead {
+            block_size: BLOCK,
+            blocks_ahead: 32,
+        };
+        ReadAheadReader::new(runtime, source, (blocks * BLOCK) as u64, options)
+    }
+
+    /// Plays 10 ms per block (100 kB/s) from block 40 on, after a start that
+    /// is allowed to wait; returns the longest wait for a block.
+    fn longest_wait_playing(mut r: ReadAheadReader<Spiky>, blocks: usize) -> Duration {
+        let mut buf = vec![0u8; BLOCK];
+        let mut longest = Duration::ZERO;
+        for block in 0..blocks {
+            let began = Instant::now();
+            r.read_exact(&mut buf).unwrap();
+            if block >= 40 {
+                longest = longest.max(began.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        longest
+    }
+
+    /// The old fixed read-ahead (3 reads in flight) is out of data when one
+    /// second of requests are held back; a buffer of a few seconds is not.
+    #[test]
+    fn a_large_buffer_rides_out_a_one_second_latency_spike() {
+        let blocks = 240;
+        let small = spiky_reader(blocks, 100..110).with_max_in_flight(3);
+        let stalled = longest_wait_playing(small, blocks);
+        assert!(stalled > Duration::from_millis(400), "small: {stalled:?}");
+
+        let big = spiky_reader(blocks, 100..110).with_adaptive(Adaptive {
+            seconds: 3.0,
+            min_bytes: 4 * BLOCK,
+            max_bytes: 400 * BLOCK,
+            in_flight: 12,
+        });
+        big.metrics().set_rate_hint(100_000);
+        let metrics = big.metrics();
+        let waited = longest_wait_playing(big, blocks);
+        assert!(waited < Duration::from_millis(100), "big: {waited:?}");
+        // The spike shows in the figures, and the buffer was kept full.
+        let window = metrics.take();
+        assert!(window.max_ms >= 1000.0, "{window}");
+        assert!(window.p50_ms < 100.0, "{window}");
+        assert!(window.in_flight_mean.unwrap() > 1.0, "{window}");
+        assert!(
+            window.target_mib * (1 << 20) as f64 >= 299_000.0,
+            "{window}"
+        );
+    }
+
+    #[test]
+    fn the_buffer_never_holds_more_than_its_memory_cap() {
+        let blocks = 400;
+        let mut r = spiky_reader(blocks, 0..0).with_adaptive(Adaptive {
+            seconds: 30.0,
+            min_bytes: 4 * BLOCK,
+            max_bytes: 50 * BLOCK,
+            in_flight: 12,
+        });
+        // A stream far faster than the cap: 30 s of it would be 3 GB.
+        r.metrics().set_rate_hint(100_000_000);
+        let mut buf = vec![0u8; BLOCK];
+        let mut most = 0;
+        for _ in 0..blocks {
+            r.read_exact(&mut buf).unwrap();
+            // Let the link catch up: the buffer is as full as it gets.
+            std::thread::sleep(Duration::from_millis(1));
+            most = most.max(r.blocks.len());
+        }
+        // The cap, and the block read now and the one kept behind it.
+        assert!(most <= 50 + 2, "held {most} blocks");
+        assert!(most >= 40, "never filled the buffer: {most}");
+        assert!(r.cache.len() * BLOCK <= KEPT_BYTES);
+    }
+
+    #[test]
+    fn the_buffer_follows_the_stream_rate_and_grows_after_stalls() {
+        let mut r = spiky_reader(10, 0..0).with_adaptive(Adaptive {
+            seconds: 10.0,
+            min_bytes: 4 * BLOCK,
+            max_bytes: 100 * BLOCK,
+            in_flight: 12,
+        });
+        // Nothing known: the minimum (a 1080p-sized stream stays cheap).
+        assert_eq!(r.target_blocks(), 4);
+        r.metrics().set_rate_hint(5_000);
+        assert_eq!(r.target_blocks(), 50);
+        // A stall while the window was still growing does not count…
+        r.window = 8;
+        r.target = 50;
+        r.note_stall();
+        assert_eq!(r.target_blocks(), 50);
+        // …in steady reading each one grows the buffer, up to the cap.
+        r.window = 50;
+        r.note_stall();
+        assert_eq!(r.target_blocks(), 75);
+        r.note_stall();
+        r.note_stall();
+        assert_eq!(r.target_blocks(), 100);
+        // Slow streams stay at the minimum, fast ones are capped.
+        r.metrics().set_rate_hint(100);
+        r.boost = 1.0;
+        assert_eq!(r.target_blocks(), 4);
+        r.metrics().set_rate_hint(10_000_000);
+        assert_eq!(r.target_blocks(), 100);
+    }
+
+    #[test]
+    fn a_fixed_reader_keeps_its_count_of_blocks() {
+        let mut r = spiky_reader(10, 0..0);
+        r.metrics().set_rate_hint(1_000_000);
+        assert_eq!(r.target_blocks(), 32);
     }
 }

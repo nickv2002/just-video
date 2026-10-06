@@ -382,9 +382,10 @@ impl SmbSession {
     }
 
     /// Like [`SmbSession::open_owned`] over several sessions (connections) to
-    /// the same server: each read goes to the least busy one. Over Wi-Fi two
-    /// TCP connections carry 30-50 % more than one, and ride out a stall of
-    /// one of them. Sessions after the first that can't open the file are
+    /// the same server: each read goes to the least busy one. Over Wi-Fi each
+    /// TCP connection is held to ~70-85 Mbit/s by loss (the server's
+    /// congestion window stays near 30), so four carry ~35 % more than two
+    /// (docs/perf-notes.md, "Read buffer"), and ride out a stall of one. Sessions after the first that can't open the file are
     /// left out.
     pub fn open_striped(
         sessions: &[Arc<Self>],

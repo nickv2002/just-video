@@ -277,10 +277,17 @@ pub fn open_video(
             })
             .map_err(|e| e.to_string())?;
     }
+    // The buffer ahead is sized in seconds of this video (see `Adaptive`);
+    // the stream's rate is known once the file has been probed.
+    let mut stream = None;
     let media = SmbSession::open_striped(sessions, share, &smb_path(path), ReadAhead::default())
         .map_err(err)
         .and_then(|reader| {
             timing.lap("open file");
+            let reader = reader
+                .with_adaptive(crate::readahead::Adaptive::default())
+                .for_playback();
+            stream = Some((reader.metrics(), reader.len()));
             Media::open(&name, reader).map_err(err)
         });
     timing.lap("probe");
@@ -298,6 +305,11 @@ pub fn open_video(
     timing.lap("rest of sidecars");
     let media = media?;
     timing.note(format!("probe read {}", media.io()));
+    if let Some((metrics, bytes)) = stream
+        && media.info().duration_seconds > 1.0
+    {
+        metrics.set_rate_hint((bytes as f64 / media.info().duration_seconds) as u64);
+    }
     let video = media.info().video.clone();
     let assessment = playability::assess(Platform::current(), video.as_ref());
     let mut layout = vr::detect(&name, video.as_ref());
@@ -426,7 +438,7 @@ pub fn file_key(server: &Server, share: &str, path: &Path) -> String {
 }
 
 /// Connections a playing video reads over (see [`SmbSession::open_striped`]).
-pub const VIDEO_CONNECTIONS: usize = 2;
+pub const VIDEO_CONNECTIONS: usize = 4;
 
 /// Connects [`VIDEO_CONNECTIONS`] sessions at once for one video, signed in
 /// straight to `share` (not to the server's IPC$ first: a round trip less);

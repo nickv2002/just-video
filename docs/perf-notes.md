@@ -175,3 +175,82 @@ play at 60 Hz: 2396-2397 of 2398 pictures shown on both.
 Not measured: a real headset taken off and put on (the app change that makes the frame loop
 keep taking pictures is in `app.rs` and only exercised by reasoning and the bench stand-in);
 Steam's web helper holding a session (`/proc/*/fd` showed none holding the decoder during the runs).
+
+## Read buffer (2026-10-05)
+
+Question: the worn-headset log showed 15-34 MiB read per 5 s window (about 6 MiB/s) with 0.8-3.4 s
+of read wait, while 32 MiB were meant to be in flight. Why was the throughput so low?
+
+**What limits it (headset over Wi-Fi to the NAS, 8K HEVC side-by-side file, 300-400 MiB `read-bench`):**
+
+- The 6 MiB/s was what the demuxer consumed while it was blocked, not what the link carries. Unworn,
+  the link gave 125-230 Mbit/s (15-28 MiB/s); the file needs ~6 MiB/s on average (`play` at 1038 s
+  reads 29-30 MiB per 5 s) and about 13 MiB/s in its busiest parts. Headroom is only 1.3-2x, so a
+  slow second empties the buffer, and a fresh play fills it at (link minus playback) only.
+- The window does reach 32 blocks and stays there while playing straight on; it restarts at 4 only
+  after a jump. A decoder replacement reopens the decoder on the same reader (a seek back to a
+  keyframe that is still in the kept blocks). So the depth, not the mechanism, was short: 32 MiB is
+  3 s at 10 MiB/s, and at most 3 reads (3 MiB) were requested at a time.
+- More reads in flight do not carry more: 3 / 8 / 16 in flight over 2 connections, 300 MiB, 2 rounds
+  each: 130-142 / 143-144 / 133-150 Mbit/s, but the median request time went 164-197 / 459 /
+  918-1049 ms (the reads queue on the link). Over 4 connections 3 / 4 / 6 / 8 in flight (4 rounds,
+  medians): 201 / 217 / 202 / 209 Mbit/s. SMB credits (1024 backlog, 16 per 1 MiB read), the
+  negotiated read size (Samba allows 8 MiB, the client asks 1 MiB) and the single decode thread are
+  not limits.
+- Each TCP connection is what is limited. Medians of 4 alternating rounds, 300 MiB, 3 in flight:
+  2 connections 150 Mbit/s, 3: 186, 4: 202 (1 connection ~127 in two runs). On the server (`ss -ti`,
+  read only) each connection to the headset had cwnd ~30 and ssthresh 23-32 (CUBIC backing off),
+  delivery rate 70-85 Mbit/s, and 330-370 retransmitted segments within one 20 s run: loss on the
+  Wi-Fi path holds each flow down. On the headset the SMB threads used 1-5 % CPU, rtt 4 ms, receive
+  window ~1 MiB: neither the client CPU nor the receive window.
+
+**Changes:**
+
+- The playing video's buffer aims at 10 s of the stream (file size over duration) between 16 and
+  160 MiB. A stall of 150 ms or more in steady reading grows the aim by half (up to 3x, the 160 MiB
+  cap still holds); the growth halves back every 60 s without one. After a jump the window still
+  starts at 4 blocks and doubles per block, with the old 3 reads in flight (4 at once after a jump
+  made jumps ~10 % slower in one comparison, and nothing was gained).
+- A playing video is read over 4 connections instead of 2 (+35 % over 2 in `read-bench`).
+- The `decoder side:` log part gains `N requests took P50/P99/MAX ms, in flight mean X, buffered
+  ahead min A mean B MiB of T aimed`. Reading it: buffered ahead near 0 with a long read wait is
+  the link falling behind playback; ahead near the aim with a long request time is harmless.
+- `read-bench` and `play` take `--max-in-flight N` (the old fixed policy), `--buffer-seconds`,
+  `--buffer-mib` and `--buffer-in-flight`, to compare.
+- Tests with a source whose requests 100-109 take 1 s: with the old policy the consumer waits
+  ~0.6 s, with a 3 s buffer it never waits more than 100 ms. The memory cap (50 blocks held), the
+  aim following the rate, the growth after stalls and the minimum for slow streams are tested too.
+
+**Measured (headset, nobody wearing it, hardware decoder, muted; installed build against this one,
+alternating, medians):**
+
+- `read-bench` 400 MiB, 4 rounds: 114 -> 146 Mbit/s (installed 134 / 124 / 77 / 105, new 141 / 170 /
+  114 / 151; another process was using the link in rounds 3 and 4).
+- `bench-seek --from 1038 --play 40 --hz 60`, 4 rounds: shown 2395.5 -> 2396 of 2398 due, skipped
+  1.5 -> 1, behind ticks 0 / 0. In its first round the installed build alone had a real stall (open
+  1051 ms, 149 skipped, 615 behind ticks); the new build had none in its four. One event, not a result.
+- `bench-seek` jumps (11 per run, sum of shown_ms; 10 installed runs, 6 new runs): 4369 -> 4239 ms,
+  open 270 -> 291 ms, first frame 385 -> 410 ms: no change within the noise (a batch of 4 pairs on
+  a busy link was left out: the installed open took up to 3.2 s in it).
+- `play` with `JUST_VIDEO_RENDER_UNSEEN=1`, 60 s from 1038 s, 2 runs each: first 5 s window, skipped
+  18 / 11 installed against 10 / 5 new, read wait 788 / 673 ms against 544 / 593 ms; every later
+  window 300 of 300 shown with both. The new log shows the buffer reaching its 59 MiB aim after
+  ~15 s (min buffered 0, 23, 50, 54, 56, 57 MiB in successive windows), request time 80-200 ms,
+  max 733 ms once.
+- `bench --replay` decodes from memory, so it does not touch the reader and was not repeated.
+- Not reproduced: the worn-headset stutter itself (Wi-Fi spikes cannot be made on demand). The
+  buffer is meant for it: at 6-13 MiB/s, 10 s is 60-130 MiB, against 3 s (32 MiB) before.
+- Memory: `VmRSS` of `play` after 50 s: 1.23 GB with the new build, 1.17 GB installed, so +60 MiB
+  at this file's 6 MiB/s (59 MiB aimed). At 13 MiB/s the aim is the 160 MiB cap. The blocks kept
+  behind the reader (up to 192 MiB, unchanged) come on top. The headset had 11 GB available.
+- The rate comes from the average bitrate; a variable-bitrate peak above it is what the growth
+  after stalls is for.
+
+**Server side (n5, read only `testparm -sv`, `ss`; nothing was changed):** Samba is not the limit:
+`smb2 max credits = 8192`, `smb2 max read = 8 MiB`, `aio read size = 1`, `use sendfile = No`
+(default), `socket options = TCP_NODELAY`; cold 1 MiB reads were 300+ MiB/s. What would help is the
+TCP congestion control for the Wi-Fi path: `tcp_bbr` exists as a module but only reno and cubic
+are available, and CUBIC cuts its window at every loss. Suggested (needs root, untested):
+`modprobe tcp_bbr`, `sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr`, then
+compare `read-bench --connections 1`. Also worth checking: the access point's channel, and that the
+headset's retries stay at 0 under load (reported link: -55 dBm, 360 Mbit/s).
