@@ -699,6 +699,10 @@ pub fn run(
     // Testing over SSH with nobody wearing the headset: the runtime never asks
     // for frames then, so draw them anyway (it just doesn't show them).
     let render_unseen = std::env::var_os("JUST_VIDEO_RENDER_UNSEEN").is_some();
+    // Timed pause / jump / A-B / headset-off actions, for tests over SSH.
+    let mut script = super::script::Script::from_env();
+    let script_start = Instant::now();
+    let mut script_off = false;
     let mut timing = FrameTiming::default();
     if let Mode::Playing(playback) = &mode {
         timing.watch(Some(playback.pipeline()));
@@ -760,7 +764,21 @@ pub fn run(
         ctx.frame_stream.begin()?;
         timing.add(Phase::Wait, lap(&mut mark));
         stats.xr_frames += 1;
-        if !state.should_render && !render_unseen {
+        if let Mode::Playing(playback) = &mut mode {
+            for action in script.due(script_start.elapsed()) {
+                use super::script::Action;
+                eprintln!("Script: {action:?} at {:.1} s", playback.position());
+                match action {
+                    Action::Pause => playback.toggle_pause(state.predicted_display_time.as_nanos()),
+                    Action::JumpTo(t) => playback.seek(t),
+                    Action::JumpBy(d) => playback.seek(playback.position() + d),
+                    Action::Loop => ab_loop.press(playback.position()),
+                    Action::Off => script_off = true,
+                    Action::On => script_off = false,
+                }
+            }
+        }
+        if script_off || (!state.should_render && !render_unseen) {
             // Headset off: nothing is drawn, but the pictures keep being taken, or
             // the decoder starves, is replaced for it and the replacement refused.
             if let Mode::Playing(playback) = &mut mode {

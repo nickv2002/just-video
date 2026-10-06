@@ -8,3 +8,4 @@ pub mod pipeline_stats;
 pub mod player;
 pub mod renderer;
 pub mod runtime;
+pub mod script;
