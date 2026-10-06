@@ -16,6 +16,11 @@ pub struct ReadMetrics {
     /// Request-to-completion times, log-scaled (see [`bucket_of`]).
     latency: [AtomicU64; BUCKETS],
     latency_max_us: AtomicU64,
+    /// Running average of request times (µs), outliers held back: what a
+    /// request normally takes right now.
+    typical_us: AtomicU64,
+    /// Blocks asked for a second time (see `ReadAheadReader::with_hedge`).
+    hedged: AtomicU64,
     in_flight_sum: AtomicU64,
     in_flight_samples: AtomicU64,
     /// Finished bytes waiting ahead of the reader, sampled at every read.
@@ -53,6 +58,8 @@ impl Default for ReadMetrics {
         Self {
             latency: std::array::from_fn(|_| AtomicU64::new(0)),
             latency_max_us: AtomicU64::new(0),
+            typical_us: AtomicU64::new(0),
+            hedged: AtomicU64::new(0),
             in_flight_sum: AtomicU64::new(0),
             in_flight_samples: AtomicU64::new(0),
             ahead_min: AtomicU64::new(u64::MAX),
@@ -70,6 +77,24 @@ impl ReadMetrics {
         let us = took.as_micros().min(u64::MAX as u128) as u64;
         self.latency[bucket_of(us)].fetch_add(1, Relaxed);
         self.latency_max_us.fetch_max(us, Relaxed);
+        // An eighth of each new time, but a stall counts for at most 3x the
+        // average, so one stall does not make slow look normal.
+        let old = self.typical_us.load(Relaxed);
+        let new = if old == 0 {
+            us
+        } else {
+            old - old / 8 + us.min(old * 3) / 8
+        };
+        self.typical_us.store(new, Relaxed);
+    }
+
+    pub(crate) fn note_hedge(&self) {
+        self.hedged.fetch_add(1, Relaxed);
+    }
+
+    /// What a request normally takes lately (zero before the first).
+    pub(crate) fn typical_latency(&self) -> Duration {
+        Duration::from_micros(self.typical_us.load(Relaxed))
     }
 
     /// The reader looks at its buffer: `in_flight` requests out, `ahead`
@@ -128,6 +153,7 @@ impl ReadMetrics {
             ahead_mean_mib: (ahead_samples > 0)
                 .then(|| ahead_sum as f64 / ahead_samples as f64 / MIB),
             target_mib: self.target.load(Relaxed) as f64 / MIB,
+            hedged: self.hedged.swap(0, Relaxed),
         }
     }
 }
@@ -143,6 +169,8 @@ pub struct ReadWindow {
     pub ahead_min_mib: Option<f64>,
     pub ahead_mean_mib: Option<f64>,
     pub target_mib: f64,
+    /// Blocks asked for again because the first request was slow.
+    pub hedged: u64,
 }
 
 impl std::fmt::Display for ReadWindow {
@@ -161,7 +189,11 @@ impl std::fmt::Display for ReadWindow {
             (Some(min), Some(mean)) => write!(f, "{min:.0} mean {mean:.0}")?,
             _ => write!(f, "-")?,
         }
-        write!(f, " MiB of {:.0} aimed", self.target_mib)
+        write!(f, " MiB of {:.0} aimed", self.target_mib)?;
+        if self.hedged > 0 {
+            write!(f, ", {} slow blocks asked again", self.hedged)?;
+        }
+        Ok(())
     }
 }
 
@@ -203,6 +235,23 @@ mod tests {
             }
             assert!(bucket_top(b) as f64 <= us as f64 * 1.26 + 4.0, "{us}");
         }
+    }
+
+    #[test]
+    fn typical_latency_follows_the_link_but_not_single_stalls() {
+        let m = ReadMetrics::default();
+        assert_eq!(m.typical_latency(), Duration::ZERO);
+        for _ in 0..40 {
+            m.request_done(Duration::from_millis(60));
+        }
+        m.request_done(Duration::from_millis(5000));
+        let after_stall = m.typical_latency();
+        assert!(after_stall < Duration::from_millis(100), "{after_stall:?}");
+        // A link that stays slow does show.
+        for _ in 0..60 {
+            m.request_done(Duration::from_millis(400));
+        }
+        assert!(m.typical_latency() > Duration::from_millis(300));
     }
 
     #[test]

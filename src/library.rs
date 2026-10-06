@@ -286,6 +286,7 @@ pub fn open_video(
             timing.lap("open file");
             let reader = reader
                 .with_adaptive(crate::readahead::Adaptive::default())
+                .with_hedge(crate::readahead::hedge_floor())
                 .for_playback();
             stream = Some((reader.metrics(), reader.len()));
             Media::open(&name, reader).map_err(err)

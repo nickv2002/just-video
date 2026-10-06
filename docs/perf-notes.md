@@ -318,3 +318,98 @@ to trim (the earlier notes already cover the other candidates).
 
 Not measured: a real headset worn (compositor busy), Steam's helper holding a decoder session, the
 server's side of a Wi-Fi drop (only the headset's sends were shaped).
+
+## Transport on a weak link (2026-10-06, perf/transport-night2)
+
+Aim: keep playing when the Wi-Fi is jittery. The link could not be made weak on demand (the headset
+sat at -45 dBm, rx 865 Mbit/s, 0 tx retries), so the measurements below are of a good link plus
+injected faults; they say nothing about the weak position itself.
+
+**Server BBR (route to the headset has `congctl bbr`) changes the picture.** `read-bench`, 8K HEVC
+file, 300 MiB, medians of 3-4 alternating rounds, 3 reads in flight:
+
+| connections | 1 | 2 | 3 | 4 | 6 | 8 |
+|---|---|---|---|---|---|---|
+| Mbit/s | 405 | 387 (372 in an earlier set) | 324 | 369 | 362 | 361 |
+
+Before (CUBIC, farther from the AP): 1 connection ~127, 2: 150, 4: 202. Now one connection carries
+what four do, and more connections no longer help (noise is ~10 %: 280-420 within one setting).
+`ss -ti` on the server during a run: cwnd 500-580 (CUBIC sat near 30), 1.2-1.6 % of bytes
+retransmitted, `rwnd_limited` 0.1 %, so the headset's receive window (autotuning max 32 MiB) is not
+a limit and a bigger `SO_RCVBUF` was not tried. `TCP_NODELAY` was already set. The position and
+BBR changed together, so how much of 127 -> 405 is BBR cannot be measured here (the headset has no IPv6 or
+other route to the server to get a CUBIC path, and changing its network overnight was not worth the risk).
+Inference from the figures: 1.2-1.6 % retransmission is about 5x what CUBIC saw before (0.2-0.3 %), and a
+loss-driven controller at that loss and ~10 ms rtt would be held to tens of Mbit/s per flow, so on this
+path BBR's window is not being cut by loss. Whether CUBIC would also do well at -45 dBm is unmeasured.
+Kept at 4 connections: the cost with
+BBR is within noise, they carry 35 % more under CUBIC, and the second-chance read (below) needs
+more than one. 6 and 8 gained nothing at either position.
+
+**Reads in flight and read size, same link (4 rounds, medians):** 3 / 6 / 12 in flight: 346 / 389 /
+410 Mbit/s (request p50 82 / 115 / 229 ms); 2 MiB reads with 3 / 6 in flight: 371 / 401. With BBR
+the link is no longer the limit at 3 in flight (3 MiB over 66 ms is ~380 Mbit/s), unlike with CUBIC
+(3 = 8 = 16 there). Not adopted: the stream needs ~50-100 Mbit/s, the buffer is full at this link,
+and every read in flight is one more a jump has to wait behind (4 in flight made jumps ~10 % slower
+earlier). If a faster refill after a long stall is ever wanted, raise the cap only while the buffer
+is below half its aim.
+
+**Changes kept:**
+
+- **Second request for a slow block** (`ReadAheadReader::with_hedge`). A read that has waited for its
+  block for longer than 200 ms and 3x what requests lately take (a running average of request
+  times that one stall does not move) sends the request again; the source picks the least busy
+  connection, so it goes over another one. The first answer wins, the slower request is left to
+  finish (never cancelled: credits), and it stops counting among the requests in flight at once
+  (otherwise each stalled request held one of the 3 places for its whole 1.5 s). If one of the two
+  fails, the other still answers. Costs one block per slow block (about 4 % extra bytes in the runs
+  below, none in clean runs). Only with more than one connection. `Timing: frames` shows `N slow
+  blocks asked again` when it happened; `--hedge-ms` (0 = off) and `JUST_VIDEO_HEDGE_MS` set the
+  least wait.
+- **A connection whose read failed is not chosen again.** A dead connection fails at once, so it
+  always had the fewest bytes queued: by the code every retry of a block (3, 0.2-0.6 s apart) would
+  go back to it and playback would stop with an error although three connections were fine (not
+  observed on the headset, only argued from the code). Unit-tested
+  (`pick_lane`); with `JUST_VIDEO_SIM_RESET=30` the second connection fails from the 30th read on
+  and `read-bench` still carries 315-375 Mbit/s over the other three.
+- Test hooks in `SmbFile` (do nothing unless set): `JUST_VIDEO_SIM_STALL=every,ms` holds back every
+  n-th read (a flow stalled by loss or a timeout), `JUST_VIDEO_SIM_RESET=n` as above, `JUST_VIDEO_SIM_FLOW=every,ms` holds up the whole connection the
+  n-th read went over (it and the reads after it wait out the ms: what a loss or a timeout does to a TCP flow).
+
+**Measured, headset over Wi-Fi, 8K file, alternating, medians (stall = every 20th read held 1.5 s,
+read-bench 300 MiB, 3 rounds; every 7th for jumps):**
+
+| | no stalls | stalls, no second request | stalls, 150 ms | stalls, 250 ms (first version, 200 ms now) |
+|---|---|---|---|---|
+| read-bench Mbit/s | 374 (build of 6d6396e: 376) | 88 | 273 | 243 |
+| `bench-seek` jumps, sum of 11 shown_ms | 3234 (build of 6d6396e: 3349) | 12952 | - | 4429 (200 ms) |
+
+So with stalls the second request restores 2.8-3.1x of the throughput and cuts the jumps' total
+time to a third (one flow's stall no longer holds a jump up for 1.5 s); without stalls it costs
+nothing measurable (read-bench 385 against 374, jumps within the noise of the 6d6396e build).
+The first version without the "stops counting in flight" part reached only 216 / 182 (150 / 400 ms).
+A stalled whole connection is the harsher and more realistic model (`JUST_VIDEO_SIM_FLOW=15,1500`; the
+second request still has to wait its 200 ms and the block behind it on the stalled connection is
+avoided only through the least-busy choice): `read-bench` 300 MiB, 3 rounds, off / on / no fault:
+68 / 153 / 360 Mbit/s (2.2x). Not as good as for single slow reads: each stall still costs the wait
+before the second request (~0.27 s per stall against ~0.35 s of data at 360 Mbit/s); a lower wait
+would give more (150 ms against 250 ms: 273 against 243 above) but is tuned to the simulation, so
+it was left at 200 ms and 3x the typical request.
+
+`play` (`JUST_VIDEO_RENDER_UNSEEN=1`, from 1038 s, 30 s, `SIM_FLOW=15,1500`, 3 alternating rounds of
+second request off / on with the normal buffer and with a shallow one, 1 s / 16 MiB), the `read wait`
+figures of the timing log summed over the run: normal buffer 9.2 / 8.6 / 9.5 s total, longest
+1.5-1.6 s without; 2.4 / 3.8 / 3.4 s, longest 255-387 ms with. Shallow:
+8.8 / 9.0 / 9.4 s, longest 1.5-1.8 s without; 3.1 / 4.0 / 4.3 s, longest 252-277 ms with; 6-12 slow
+blocks asked again per run. The fault is far worse than any real link would give (a stall every 2.5 s),
+and in those runs the hardware decoder itself was slow (decode 25-36 ms mean, a quarter of the
+pictures shown; an earlier batch of the same test had 1860-1900 pictures shown in the first round and
+read wait 1.7 s against 0.65 s), so pictures shown and skipped are not comparable between rounds
+and are left out; the wait for data is what the change acts on. The boost after stalls grew the aim
+to the 160 MiB cap in these runs, as designed.
+
+**Not done / unproven:** the weak position itself (nothing here shows how much of its stutter these
+changes remove); a lane that hangs without failing is only avoided by the least-busy choice and
+rescued per block (a suspected lane could be avoided for some seconds); lost connections are not
+re-established (the video goes on over the rest, or fails when all are gone); `bench --replay`
+decodes from memory and does not touch the reader, so it was not repeated.

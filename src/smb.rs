@@ -14,7 +14,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 use tokio::runtime::Runtime;
@@ -411,6 +411,8 @@ impl SmbSession {
                 Ok((file, _)) => source.lanes.push(Lane {
                     file,
                     busy: Default::default(),
+                    dead: Default::default(),
+                    stalled_until: Default::default(),
                     _session: Some(session.clone()),
                 }),
                 Err(e) => eprintln!("SMB: reading {path} over one connection less: {e:#}"),
@@ -542,6 +544,52 @@ fn explain_write_error(message: &str) -> anyhow::Error {
 /// An open file, read over one or more connections ("lanes").
 pub struct SmbFile {
     lanes: Vec<Lane>,
+    sim: Option<Sim>,
+}
+
+/// Test hook for what the headset's Wi-Fi does and a desk can't: environment
+/// `JUST_VIDEO_SIM_STALL=every,ms` holds back every `every`-th read for `ms`
+/// (a flow stalled by loss or a retransmission timeout) and
+/// `JUST_VIDEO_SIM_RESET=n` makes the second connection fail every read from
+/// the `n`-th read on (a connection reset). `JUST_VIDEO_SIM_FLOW=every,ms`
+/// holds up the whole connection the `every`-th read went over: it and the
+/// reads that follow on it wait out the `ms` (what a loss or a timeout does to
+/// a TCP flow). Unset: nothing happens.
+struct Sim {
+    stall: Option<(u64, std::time::Duration)>,
+    flow: Option<(u64, std::time::Duration)>,
+    reset_after: Option<u64>,
+    reads: std::sync::atomic::AtomicU64,
+}
+
+/// Milliseconds since the first call (the clock of `Lane::stalled_until`).
+fn sim_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+impl Sim {
+    fn from_env() -> Option<Self> {
+        let pair = |name: &str| {
+            std::env::var(name).ok().and_then(|v| {
+                let (every, ms) = v.split_once(',')?;
+                Some((
+                    every.trim().parse::<u64>().ok()?.max(1),
+                    std::time::Duration::from_millis(ms.trim().parse().ok()?),
+                ))
+            })
+        };
+        let (stall, flow) = (pair("JUST_VIDEO_SIM_STALL"), pair("JUST_VIDEO_SIM_FLOW"));
+        let reset_after = std::env::var("JUST_VIDEO_SIM_RESET")
+            .ok()
+            .and_then(|v| v.trim().parse().ok());
+        (stall.is_some() || flow.is_some() || reset_after.is_some()).then(|| Self {
+            stall,
+            flow,
+            reset_after,
+            reads: Default::default(),
+        })
+    }
 }
 
 /// The file opened on one connection.
@@ -549,6 +597,11 @@ struct Lane {
     file: File,
     /// Bytes requested on this lane and not yet received.
     busy: AtomicUsize,
+    /// A read failed here: the connection is probably gone, so requests go
+    /// elsewhere (retries must not return to it, it would always look idle).
+    dead: AtomicBool,
+    /// Test hook (`Sim`): the flow is held up until this many ms after `sim_ms` zero.
+    stalled_until: std::sync::atomic::AtomicU64,
     /// Keeps a dedicated session (and its connection) alive while reading.
     _session: Option<Arc<SmbSession>>,
 }
@@ -559,18 +612,39 @@ impl SmbFile {
             lanes: vec![Lane {
                 file,
                 busy: Default::default(),
+                dead: Default::default(),
+                    stalled_until: Default::default(),
                 _session: session,
             }],
+            sim: Sim::from_env(),
         }
     }
 
-    /// The lane with the least data still to come: a read after a jump goes
-    /// past reads left from before it (they can't be cancelled).
+    /// The live lane with the least data still to come: a read after a jump
+    /// goes past reads left from before it (they can't be cancelled).
     fn least_busy(&self) -> usize {
-        (0..self.lanes.len())
-            .min_by_key(|&i| self.lanes[i].busy.load(Ordering::SeqCst))
-            .unwrap_or(0)
+        let busy: Vec<usize> = self
+            .lanes
+            .iter()
+            .map(|l| l.busy.load(Ordering::SeqCst))
+            .collect();
+        let dead: Vec<bool> = self
+            .lanes
+            .iter()
+            .map(|l| l.dead.load(Ordering::SeqCst))
+            .collect();
+        pick_lane(&busy, &dead)
     }
+}
+
+/// The index of the lane with the fewest bytes outstanding, skipping dead
+/// ones unless every lane is dead.
+fn pick_lane(busy: &[usize], dead: &[bool]) -> usize {
+    let any_alive = dead.iter().any(|d| !d);
+    (0..busy.len())
+        .filter(|&i| !any_alive || !dead[i])
+        .min_by_key(|&i| busy[i])
+        .unwrap_or(0)
 }
 
 /// Gives a lane's bytes back when its read ends (or is dropped).
@@ -582,29 +656,78 @@ impl Drop for Busy<'_> {
     }
 }
 
+impl SmbFile {
+    async fn read_lane(lane: &Lane, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        lane.busy.fetch_add(len, Ordering::SeqCst);
+        let _busy = Busy(&lane.busy, len);
+        let mut buffer = vec![0u8; len];
+        let mut filled = 0;
+        while filled < len {
+            let n = lane
+                .file
+                .read_block(&mut buffer[filled..], offset + filled as u64, None, false)
+                .await?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SMB file shorter than reported",
+                ));
+            }
+            filled += n;
+        }
+        Ok(buffer)
+    }
+}
+
 impl BlockSource for SmbFile {
     fn fetch(self: Arc<Self>, offset: u64, len: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
         Box::pin(async move {
-            let lane = &self.lanes[self.least_busy()];
-            lane.busy.fetch_add(len, Ordering::SeqCst);
-            let _busy = Busy(&lane.busy, len);
-            let mut buffer = vec![0u8; len];
-            let mut filled = 0;
-            while filled < len {
-                let n = lane
-                    .file
-                    .read_block(&mut buffer[filled..], offset + filled as u64, None, false)
-                    .await?;
-                if n == 0 {
+            let which = self.least_busy();
+            let lane = &self.lanes[which];
+            if let Some(sim) = &self.sim {
+                let n = sim.reads.fetch_add(1, Ordering::SeqCst) + 1;
+                if which == 1 && sim.reset_after.is_some_and(|after| n >= after) {
+                    lane.dead.store(true, Ordering::SeqCst);
                     return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "SMB file shorter than reported",
+                        io::ErrorKind::ConnectionReset,
+                        "simulated connection reset",
                     ));
                 }
-                filled += n;
+                if let Some((every, hold)) = sim.stall
+                    && n % every == 0
+                {
+                    // Counts as queued on this lane, like a real stalled flow.
+                    lane.busy.fetch_add(len, Ordering::SeqCst);
+                    let _busy = Busy(&lane.busy, len);
+                    tokio::time::sleep(hold).await;
+                }
+                if let Some((every, hold)) = sim.flow {
+                    let now = sim_ms();
+                    if n % every == 0 {
+                        lane.stalled_until
+                            .fetch_max(now + hold.as_millis() as u64, Ordering::SeqCst);
+                    }
+                    let until = lane.stalled_until.load(Ordering::SeqCst);
+                    if until > now {
+                        lane.busy.fetch_add(len, Ordering::SeqCst);
+                        let _busy = Busy(&lane.busy, len);
+                        tokio::time::sleep(std::time::Duration::from_millis(until - now)).await;
+                    }
+                }
             }
-            Ok(buffer)
+            let result = Self::read_lane(lane, offset, len).await;
+            if result.is_err() {
+                lane.dead.store(true, Ordering::SeqCst);
+            }
+            result
         })
+    }
+
+    fn lanes(&self) -> usize {
+        self.lanes
+            .iter()
+            .filter(|l| !l.dead.load(Ordering::SeqCst))
+            .count()
     }
 
     fn close(&self) -> BoxFuture<'_, ()> {
@@ -623,6 +746,16 @@ pub type SmbReader = ReadAheadReader<SmbFile>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_lanes_are_skipped_even_when_they_look_idle() {
+        assert_eq!(pick_lane(&[5, 0, 3], &[false, false, false]), 1);
+        // A dead connection fails at once, so it always has the least queued.
+        assert_eq!(pick_lane(&[5, 0, 3], &[false, true, false]), 2);
+        // With none alive, any is tried (the retries then fail with the real error).
+        assert_eq!(pick_lane(&[5, 2], &[true, true]), 1);
+        assert_eq!(pick_lane(&[7], &[false]), 0);
+    }
 
     #[test]
     fn parses_full_url() {
