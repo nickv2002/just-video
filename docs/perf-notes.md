@@ -291,8 +291,8 @@ second decoder session, so the exact limit is unproven). Neither is kept.
 (`Frame::detach`, `PictureMemory`, `StagingPool` in `renderer.rs`). It is the one copy the frame loop made
 anyway (`copy ahead`), moved to the decode thread, so there is no second copy and no extra CPU. The
 driver's buffer is free again at once, the queue can be 8 deep (130 ms at 60 fps; 8K pictures are 44 MB, so
-about 530 MB of staging memory with the 2 on screen and in flight, and the two per-slot buffers are no longer
-allocated), and the frame loop no longer copies at all. Staging buffers are recycled; the one the GPU
+an estimated 530 MB of staging memory with the pictures on screen and in flight, which `VmRSS` does not show; the two
+per-slot buffers are no longer allocated), and the frame loop no longer copies at all. Staging buffers are recycled; the one the GPU
 reads is held by the frame's slot until its fence passes. Without a renderer (`bench-seek`) or with
 `JUST_VIDEO_NO_DETACH=1` frames are held as before; `JUST_VIDEO_DETACH=1` forces a copy into plain memory.
 
@@ -303,7 +303,12 @@ frame-loop thread CPU 384-410 ticks -> 117-138; decode thread 33-39 -> 292-319 t
 mean 3.9 -> 7.9 with queue 8; skipped, display periods missed (84) and pictures held 4+ periods (12) identical in
 all variants (the loop's own stalls). Jumps (`bench-seek`, 17 per run, 3 rounds, forced plain-memory copy against
 holding): median 258 / 217 / 214 ms against 207 / 221 / 226 ms, one `-12` replacement per jump either way:
-no change. A 1080p H.264 file plays the same with the staging pool (queue 8, 0.3 ms copies).
+no change (the pool has no renderer in `bench-seek`, so jumps with the pool's memory allocated were not run).
+A 1080p H.264 file plays the same with the staging pool (queue 8, 0.3 ms copies). Checked on the 6K file, pool against
+`JUST_VIDEO_NO_DETACH=1`, same screenshot time: the two left-eye PNGs have the same md5, both runs exit status 0,
+no kernel faults (kgsl, iommu, iris) in the journal. Window 1 of the default run (the first frames are taken before the
+renderer publishes its pool, so they still hold driver buffers): first frame 172-182 ms, 0 skipped, queue min 7 by the
+end of the window, no `nothing decoded`; the NO_DETACH runs: first frame 162-387 ms, 0 and 14 skipped.
 
 **Kept: two copy threads instead of four.** The copy is bound by memory bandwidth, not by cores: 8K into
 plain memory, `bench-seek --play`, 2 rounds: 4 threads 3.1 ms mean / 9.5 s CPU, 2 threads 3.0 ms / 5.1-5.6 s,
@@ -335,6 +340,7 @@ same `copy ahead` (1.7 ms); with the staging pool 14.4-15.5 -> 9.5-9.6 s. `JUST_
   be made. The 8K evidence is the plain-memory variant above (same queue, same effect on the decoder) and
   the pool at 6K. Run the 8K `play` once with `JUST_VIDEO_NO_DETACH=1` against the default to confirm queue
   depth ~8 and no `nothing decoded` at the start.
+- Decoder replacement at jumps with the pool's staging memory allocated (no renderer in `bench-seek`).
 - Worn-headset behaviour (compositor and GPU load, Wi-Fi), and the 8K startup stall's cause beyond the buffer count.
 - `JUST_VIDEO_TEST_HITCH` (frame loop stalls) and 120 ms are an approximation of a busy compositor.
 - Not tried: importing the driver's DMABUFs into Vulkan (no CPU copy at all; needs the buffers' format
