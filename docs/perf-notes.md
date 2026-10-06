@@ -50,3 +50,49 @@ a second and was left alone). 8K software playback showed no difference with or 
   per-video open time (270 ms median either way).
 - **Caching glyph coverage without cloning it per drawn character:** no measurable change
   in a repaint (4.60 against 4.56 ms before the rectangle fix, 1.40 against 1.39 after), not kept.
+
+## 8K stutter investigation (2026-10-05)
+
+Report: a 1080p H.264 flat file plays perfectly; the 8K (7680x3840, 60 fps, 8-bit HEVC) 180°
+side-by-side file and a 6K HEVC side-by-side file, both on the hardware decoder, show 70-180
+pictures uploaded and 60-190 skipped per 5 s window. Rendering never missed a display period.
+
+**What the headset log (build ae02651) shows, without any headset test:**
+
+- 29 windows of 6K/8K playback, 23 with skips. Pictures delivered per second (uploaded + skipped)
+  had a median of 58 (range 8.6-73): the decoder is bursty, not uniformly slow. Pictures actually
+  shown, median 32 per second at a 60 Hz display of 60 fps video.
+- Smooth windows (302 uploaded, 0 skipped, copy ahead ~3 ms) came after 30-40 s of playing the same
+  file; the first minute of every play was the worst. Bad windows have copy ahead 0.0: the next
+  picture was never ready between frames.
+- The worst window (14 pictures, 69 audio writes, picture-vs-sound gap 2.4 s) is in the 6K file,
+  not the 8K one. The decode thread also decodes the sound, so it was blocked for several seconds
+  in one call: in the demuxer's read (the 10 s "Read-ahead: waited" message was not reached) or in
+  the V4L2 driver. The log could not tell which; the new logging does (below).
+- Of tonight's changes, none touches the playback path except `mallopt(M_TRIM_THRESHOLD)`
+  (`git diff be8ad10 ae02651` has no change in `player.rs`, `readahead.rs` or `native/`; `media.rs`
+  differs in a log line, `smb.rs` in the name cache used at connect, `app.rs` in the A-B loop,
+  autoplay and the browser canvas, which does not run while playing). Thumbnail workers stop when
+  a video opens. So `JUST_VIDEO_NO_TRIM=1` is the one comparison that can matter; the
+  per-allocation cost it adds (a 1 MiB read block and each large packet is mapped fresh) was
+  never measured with the hardware decoder.
+
+**New logging (commit "Timing log: read wait, bytes, decode time and queue depth"):** each
+`Timing: frames …` line ends with `decoder side: N pictures decoded, decode MEAN/MAX ms, read X MiB,
+read wait TOTAL ms total / MAX ms longest, queue depth min A mean B`. Decode time is the decoder
+call minus the time blocked on reads. Queue depth is the decoded pictures waiting (0-4) as the
+frame loop saw them. Reading it: a long `read wait` max with decode ~ normal is the network;
+decode max high with read wait ~0 is the decoder or driver; queue depth min 0 with a low decoded
+count is the decoder not keeping ahead.
+
+**Headset benchmarks and the old-build comparison were not run.** The player app (PID started
+16:58, idle in the file browser since 17:02) was still running at the end of the 20-minute wait
+(17:07-17:32), and the rules for this task forbid disturbing a running session. What is ready:
+`just-video bench <url> --frames 600 --replay` now decodes the same frames a second time from the
+bytes the first run read (memory, no network); the report has `decode` (network + decoder) and
+`replay_decode` (decoder only). Planned next, with the app closed and the headset muted: per
+round `bench --replay --hw-only` and `bench-seek --play 40 --from 1000 --hz 60 --json` with the
+installed build, `be8ad10` and `2c20a1e` alternating, plus `JUST_VIDEO_NO_TRIM=1`, and a
+`read-bench` that prints a line per second (it only prints every 512 MiB). The new build's lines
+need `JUST_VIDEO_RENDER_UNSEEN=1 just-video play … --hw auto --duration 60`, as `bench-seek` does
+not print them.
