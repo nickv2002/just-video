@@ -8,7 +8,10 @@ use just_video::{
     vr,
 };
 use serde_json::json;
-use std::{io::Read, time::Instant};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    time::Instant,
+};
 
 /// Just Video: VR playback straight from SMB shares.
 ///
@@ -282,6 +285,10 @@ enum Command {
         /// FFmpeg decoder option, repeatable: --decoder-opt threads=8 --decoder-opt thread_type=frame
         #[arg(long = "decoder-opt", value_name = "KEY=VALUE")]
         decoder_opts: Vec<String>,
+        /// After the run, decode the same frames again from the bytes it read
+        /// (memory, no network): the decoder's own speed.
+        #[arg(long)]
+        replay: bool,
         #[command(flatten)]
         read_ahead: ReadAheadArgs,
     },
@@ -420,6 +427,103 @@ fn open_input(
             Box::new(std::io::BufReader::with_capacity(1 << 20, file)),
             None,
         ))
+    }
+}
+
+/// Remembers every read of a run (for `bench --replay`).
+#[derive(Default, Clone)]
+struct Recording {
+    chunks: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<u64, Vec<u8>>>>,
+    len: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+struct Recorder<S> {
+    inner: S,
+    at: Recording,
+    pos: u64,
+}
+
+impl Recording {
+    fn record(&self, mut inner: Box<dyn Source>) -> Recorder<Box<dyn Source>> {
+        let len = inner.seek(SeekFrom::End(0)).unwrap_or(0);
+        let _ = inner.seek(SeekFrom::Start(0));
+        self.len.store(len, std::sync::atomic::Ordering::Relaxed);
+        Recorder {
+            inner,
+            at: self.clone(),
+            pos: 0,
+        }
+    }
+
+    fn replay(&self) -> Replay {
+        Replay {
+            at: self.clone(),
+            pos: 0,
+        }
+    }
+}
+
+impl<S: Read> Read for Recorder<S> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(out)?;
+        if n > 0 {
+            self.at
+                .chunks
+                .lock()
+                .expect("recording")
+                .insert(self.pos, out[..n].to_vec());
+            self.pos += n as u64;
+        }
+        Ok(n)
+    }
+}
+
+impl<S: Seek> Seek for Recorder<S> {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        self.pos = self.inner.seek(from)?;
+        Ok(self.pos)
+    }
+}
+
+/// Serves what a [`Recorder`] saw; a read of anything else is an error.
+struct Replay {
+    at: Recording,
+    pos: u64,
+}
+
+impl Read for Replay {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let chunks = self.at.chunks.lock().expect("recording");
+        let Some((&start, data)) = chunks.range(..=self.pos).next_back() else {
+            return Err(std::io::Error::other("not recorded"));
+        };
+        let from = (self.pos - start) as usize;
+        if from >= data.len() {
+            if self.pos >= self.at.len.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(0);
+            }
+            return Err(std::io::Error::other("not recorded"));
+        }
+        let n = out.len().min(data.len() - from);
+        out[..n].copy_from_slice(&data[from..from + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for Replay {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        let len = self.at.len.load(std::sync::atomic::Ordering::Relaxed) as i64;
+        let target = match from {
+            SeekFrom::Start(p) => p as i64,
+            SeekFrom::Current(d) => self.pos as i64 + d,
+            SeekFrom::End(d) => len + d,
+        };
+        if target < 0 {
+            return Err(std::io::Error::other("seek before the start"));
+        }
+        self.pos = target as u64;
+        Ok(self.pos)
     }
 }
 
@@ -1901,12 +2005,29 @@ fn main() -> anyhow::Result<()> {
             hw,
             hw_only,
             decoder_opts,
+            replay,
             read_ahead,
         } => {
             let (source, _session) = open_input(&input, read_ahead.get())?;
+            let recording = replay.then(Recording::default);
+            let source: Box<dyn Source> = match &recording {
+                Some(r) => Box::new(r.record(source)),
+                None => source,
+            };
             let mut media = Media::open(file_name(&input), source)?;
             let backend = hw_backend(hw);
             let stats = media.decode(backend, !hw_only, &decoder_opts.join(":"), frames)?;
+            let replayed = match recording {
+                Some(r) => {
+                    drop(media);
+                    let mut again = Media::open(file_name(&input), r.replay())?;
+                    let stats =
+                        again.decode(backend, !hw_only, &decoder_opts.join(":"), frames)?;
+                    media = again;
+                    Some(stats)
+                }
+                None => None,
+            };
             let fps = media.info().video.as_ref().map_or(0.0, |v| v.fps);
             let realtime = if fps > 0.0 {
                 stats.frames_per_second / fps
@@ -1919,6 +2040,7 @@ fn main() -> anyhow::Result<()> {
                 "layout": vr::detect(&input, media.info().video.as_ref()),
                 "playability": playability::assess(platform, media.info().video.as_ref()),
                 "decode": stats,
+                "replay_decode": replayed,
                 "realtime_factor": realtime,
                 "note": "Decode-only throughput including network reads; excludes rendering and audio.",
             }))?;
