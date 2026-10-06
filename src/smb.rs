@@ -412,6 +412,7 @@ impl SmbSession {
                     file,
                     busy: Default::default(),
                     dead: Default::default(),
+                    stalled_until: Default::default(),
                     _session: Some(session.clone()),
                 }),
                 Err(e) => eprintln!("SMB: reading {path} over one connection less: {e:#}"),
@@ -550,27 +551,41 @@ pub struct SmbFile {
 /// `JUST_VIDEO_SIM_STALL=every,ms` holds back every `every`-th read for `ms`
 /// (a flow stalled by loss or a retransmission timeout) and
 /// `JUST_VIDEO_SIM_RESET=n` makes the second connection fail every read from
-/// the `n`-th read on (a connection reset). Unset: nothing happens.
+/// the `n`-th read on (a connection reset). `JUST_VIDEO_SIM_FLOW=every,ms`
+/// holds up the whole connection the `every`-th read went over: it and the
+/// reads that follow on it wait out the `ms` (what a loss or a timeout does to
+/// a TCP flow). Unset: nothing happens.
 struct Sim {
     stall: Option<(u64, std::time::Duration)>,
+    flow: Option<(u64, std::time::Duration)>,
     reset_after: Option<u64>,
     reads: std::sync::atomic::AtomicU64,
 }
 
+/// Milliseconds since the first call (the clock of `Lane::stalled_until`).
+fn sim_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
 impl Sim {
     fn from_env() -> Option<Self> {
-        let stall = std::env::var("JUST_VIDEO_SIM_STALL").ok().and_then(|v| {
-            let (every, ms) = v.split_once(',')?;
-            Some((
-                every.trim().parse::<u64>().ok()?.max(1),
-                std::time::Duration::from_millis(ms.trim().parse().ok()?),
-            ))
-        });
+        let pair = |name: &str| {
+            std::env::var(name).ok().and_then(|v| {
+                let (every, ms) = v.split_once(',')?;
+                Some((
+                    every.trim().parse::<u64>().ok()?.max(1),
+                    std::time::Duration::from_millis(ms.trim().parse().ok()?),
+                ))
+            })
+        };
+        let (stall, flow) = (pair("JUST_VIDEO_SIM_STALL"), pair("JUST_VIDEO_SIM_FLOW"));
         let reset_after = std::env::var("JUST_VIDEO_SIM_RESET")
             .ok()
             .and_then(|v| v.trim().parse().ok());
-        (stall.is_some() || reset_after.is_some()).then(|| Self {
+        (stall.is_some() || flow.is_some() || reset_after.is_some()).then(|| Self {
             stall,
+            flow,
             reset_after,
             reads: Default::default(),
         })
@@ -585,6 +600,8 @@ struct Lane {
     /// A read failed here: the connection is probably gone, so requests go
     /// elsewhere (retries must not return to it, it would always look idle).
     dead: AtomicBool,
+    /// Test hook (`Sim`): the flow is held up until this many ms after `sim_ms` zero.
+    stalled_until: std::sync::atomic::AtomicU64,
     /// Keeps a dedicated session (and its connection) alive while reading.
     _session: Option<Arc<SmbSession>>,
 }
@@ -596,6 +613,7 @@ impl SmbFile {
                 file,
                 busy: Default::default(),
                 dead: Default::default(),
+                    stalled_until: Default::default(),
                 _session: session,
             }],
             sim: Sim::from_env(),
@@ -683,6 +701,19 @@ impl BlockSource for SmbFile {
                     let _busy = Busy(&lane.busy, len);
                     tokio::time::sleep(hold).await;
                 }
+                if let Some((every, hold)) = sim.flow {
+                    let now = sim_ms();
+                    if n % every == 0 {
+                        lane.stalled_until
+                            .fetch_max(now + hold.as_millis() as u64, Ordering::SeqCst);
+                    }
+                    let until = lane.stalled_until.load(Ordering::SeqCst);
+                    if until > now {
+                        lane.busy.fetch_add(len, Ordering::SeqCst);
+                        let _busy = Busy(&lane.busy, len);
+                        tokio::time::sleep(std::time::Duration::from_millis(until - now)).await;
+                    }
+                }
             }
             let result = Self::read_lane(lane, offset, len).await;
             if result.is_err() {
@@ -693,7 +724,10 @@ impl BlockSource for SmbFile {
     }
 
     fn lanes(&self) -> usize {
-        self.lanes.len()
+        self.lanes
+            .iter()
+            .filter(|l| !l.dead.load(Ordering::SeqCst))
+            .count()
     }
 
     fn close(&self) -> BoxFuture<'_, ()> {

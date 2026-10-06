@@ -25,8 +25,8 @@ pub trait BlockSource: Send + Sync + 'static {
     /// Reads exactly `len` bytes at `offset` (the reader never asks past the end).
     fn fetch(self: Arc<Self>, offset: u64, len: usize) -> BoxFuture<'static, io::Result<Vec<u8>>>;
 
-    /// Independent paths (connections) requests are spread over. A read left
-    /// waiting can be asked again only if there is more than one.
+    /// Independent paths (connections) requests are spread over now. A read
+    /// left waiting can be asked again only if there is more than one.
     fn lanes(&self) -> usize {
         1
     }
@@ -250,7 +250,7 @@ impl<S: BlockSource> ReadAheadReader<S> {
     /// timeout no longer holds the video up. Costs one extra block per slow
     /// block; the slower request is left to finish (never cancelled).
     pub fn with_hedge(mut self, after: Option<Duration>) -> Self {
-        self.hedge_after = after.filter(|_| self.source.lanes() > 1);
+        self.hedge_after = after;
         self
     }
 
@@ -507,7 +507,11 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
         let mut hedge: Option<JoinHandle<io::Result<Vec<u8>>>> = None;
         let mut hedged = false;
         loop {
-            let after = self.hedge_after.map(|floor| self.hedge_wait(floor));
+            // Only while there is another connection to ask on.
+            let after = self
+                .hedge_after
+                .filter(|_| self.source.lanes() > 1)
+                .map(|floor| self.hedge_wait(floor));
             if let Some(after) = after
                 && !hedged
                 && waited >= after
@@ -1311,8 +1315,8 @@ mod tests {
 
     #[test]
     fn one_connection_never_hedges() {
-        let mut single = spiky_reader(4, 0..0).with_hedge(Some(Duration::from_millis(10)));
-        assert!(single.hedge_after.is_none());
+        let mut single = spiky_reader(4, 1..2).with_hedge(Some(Duration::from_millis(10)));
         std::io::copy(&mut single, &mut std::io::sink()).unwrap();
+        assert_eq!(single.stats().hedged, 0);
     }
 }
