@@ -85,14 +85,27 @@ frame loop saw them. Reading it: a long `read wait` max with decode ~ normal is 
 decode max high with read wait ~0 is the decoder or driver; queue depth min 0 with a low decoded
 count is the decoder not keeping ahead.
 
-**Headset benchmarks and the old-build comparison were not run.** The player app (PID started
-16:58, idle in the file browser since 17:02) was still running at the end of the 20-minute wait
-(17:07-17:32), and the rules for this task forbid disturbing a running session. What is ready:
-`just-video bench <url> --frames 600 --replay` now decodes the same frames a second time from the
-bytes the first run read (memory, no network); the report has `decode` (network + decoder) and
-`replay_decode` (decoder only). Planned next, with the app closed and the headset muted: per
-round `bench --replay --hw-only` and `bench-seek --play 40 --from 1000 --hz 60 --json` with the
-installed build, `be8ad10` and `2c20a1e` alternating, plus `JUST_VIDEO_NO_TRIM=1`, and a
-`read-bench` that prints a line per second (it only prints every 512 MiB). The new build's lines
-need `JUST_VIDEO_RENDER_UNSEEN=1 just-video play … --hw auto --duration 60`, as `bench-seek` does
-not print them.
+**Headset runs (app stopped first, headset muted, iris `CORE_INIT`, hardware decoder every time):**
+
+- `bench --frames 600 --hw-only --replay`, 8K HEVC side-by-side file, 3 runs: network + decoder
+  105.9 / 106.3 / 105.8 fps; decoder alone from memory 106.2 / 106.2 / 105.7 fps. The decoder
+  does 1.77x real time and the network is not the limit at the start of the file.
+- Old-build comparison, `bench-seek --from 1038 --play 40 --hz 60` (2398 pictures due), 4 rounds
+  alternating, median shown / skipped: ae02651 (installed before) 2395 / 2; be8ad10 (before the
+  night work) 2396.5 / 0.5; 2c20a1e (the merge) 2394 / 3; newest (logging added) 2394 / 2.5; ae02651 with
+  `JUST_VIDEO_NO_TRIM=1` 2396 / 1.5; newest with `JUST_VIDEO_NO_TRIM=1` 2396 / 1. Every build plays
+  the file with at most 11 skipped pictures in 40 s and `behind_ticks` 0 (one run 12): no difference
+  between them, so none of tonight's changes shows up here. Thumbnails cannot be switched off or
+  on in `bench-seek` (the workers belong to the browser), so that case was not tested.
+- `play` with `JUST_VIDEO_RENDER_UNSEEN=1` (the real frame loop and renderer, nobody in the headset,
+  72 Hz) on the 8K file (50 s) and the 6K file (30 s): every window after the first has 300 of 300
+  pictures, 0 skipped; decode 16.6 ms mean (the decoder waits for the frame loop to free a buffer, so it
+  runs at the pace of playback), read wait under 5 ms, queue depth mean 1.0 (8K) and 4.0 (6K). The
+  first window after a resume point has 22 skipped, read wait 1.0-1.4 s total (longest 200-260 ms) and
+  queue depth min 0: the read-ahead window starting from scratch.
+- Not reproduced. The stutter in the user's log needs a condition these runs lack: the headset being
+  worn (compositor and SteamVR busy), the app started from the browser with thumbnail workers
+  running before, or Steam's helper holding a decoder session. Next time it happens, the `decoder
+  side` figures in the log tell network (read wait longest) from decoder (decode max, queue depth
+  min 0 with little read wait).
+- Found on the way: a video started from the command line (`play`) did not get the new figures (fixed).
