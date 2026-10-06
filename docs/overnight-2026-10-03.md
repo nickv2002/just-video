@@ -72,11 +72,27 @@ Still unknown until measured on the headset:
 
 ## Known, not fixed
 
-- Rolling back to `just-video.prev` resets the new player settings (the old binary drops them on save).
-- The playability marks in a folder stop updating while a video plays, and resume afterwards.
-- A long jump to near the end finishes the video.
-- Saving a server edit connects first, so you can't edit an offline server.
-- Minor: a bare IPv6 address like `fe80::1` is parsed wrongly. In subtitles, a stray `{` drops the rest of the line.
+Checked again on branch `fix/known-bugs` (each fix is its own commit there):
+
+- Rolling back to `just-video.prev` resets the new player settings: still true for the
+  binaries already built, which drop keys they don't know when they save. This build now keeps
+  unknown settings keys (top level and inside `player`) when it saves, so later rollbacks and
+  roll-forwards don't lose newer settings. `servers.json`, `resume.json` and `layouts.json` still
+  drop unknown fields on an older build.
+- The playability marks in a folder stop updating while a video plays, and resume afterwards:
+  by design, not a bug. The probe workers wait while a video opens or plays so their reads don't
+  compete with it for the link (`video_busy` in `library.rs`). Left as is; the marks catch up
+  when the video closes.
+- A long jump to near the end finished the video: fixed. A forward button jump now stops 5 s
+  before the end (and stays put when already closer). The seek bar can still go to the end.
+- Saving a server edit connected first: fixed for edits. Saving works when the server can't be
+  reached, and the list says "Saved X, but could not connect: ...". Adding still checks the login.
+- A bare IPv6 address like `fe80::1` was parsed as host and port: fixed (kept as `[fe80::1]`).
+  In subtitles, a stray `{` dropped the rest of the line: fixed.
+- Build noise, not a bug: `zig: error: version '.2.39' in target triple ...` is printed by
+  the `cc` crate probing the compiler (`--version`, `-E`) through cargo-zigbuild's wrapper, which
+  adds the `.2.39` glibc suffix to the target. The real compiles use a correct `--target`, and the
+  aarch64 binary builds and is a valid aarch64 ELF. Left alone.
 
 ## Headset benchmark (morning, 6K60 HEVC VR180 over home Wi-Fi)
 
