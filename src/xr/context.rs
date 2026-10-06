@@ -23,6 +23,8 @@ pub struct XrContext {
     pub session: xr::Session<xr::Vulkan>,
     pub frame_waiter: xr::FrameWaiter,
     pub frame_stream: xr::FrameStream<xr::Vulkan>,
+    /// The display rates the runtime offers (empty without the extension).
+    pub refresh_rates: Vec<f32>,
 }
 
 impl XrContext {
@@ -33,8 +35,23 @@ impl XrContext {
             available.khr_vulkan_enable2,
             "OpenXR runtime lacks XR_KHR_vulkan_enable2"
         );
+        if std::env::var_os("JUST_VIDEO_LIST_XR_EXTENSIONS").is_some() {
+            let mut names: Vec<String> = available
+                .other
+                .iter()
+                .map(|e| String::from_utf8_lossy(e.strip_suffix(b"\0").unwrap_or(e)).into_owned())
+                .collect();
+            names.sort();
+            eprintln!(
+                "OpenXR: runtime offers {} (XR_FB_display_refresh_rate: {})",
+                names.join(", "),
+                available.fb_display_refresh_rate
+            );
+        }
         let mut extensions = xr::ExtensionSet::default();
         extensions.khr_vulkan_enable2 = true;
+        // Lets a video ask for a display rate its frame rate divides (see `refresh`).
+        extensions.fb_display_refresh_rate = available.fb_display_refresh_rate;
         // Native Steam Frame controller bindings (otherwise SteamVR remaps Index ones).
         const FRAME_CONTROLLER: &str = "XR_VALVE_frame_controller_interaction";
         // The crate keeps these names NUL-terminated (they go to the runtime as C strings).
@@ -145,7 +162,15 @@ impl XrContext {
             )
         }
         .context("Create OpenXR session")?;
+        let refresh_rates = if extensions.fb_display_refresh_rate {
+            session
+                .enumerate_display_refresh_rates()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
+            refresh_rates,
             xr,
             system,
             system_name,

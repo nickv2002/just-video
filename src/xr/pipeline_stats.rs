@@ -20,6 +20,10 @@ pub struct PipelineStats {
     depth_min: AtomicUsize,
     depth_sum: AtomicU64,
     depth_samples: AtomicU64,
+    /// Copies of a picture out of the driver's buffer (see `Frame::detach`).
+    detached: AtomicU64,
+    detach_ns: AtomicU64,
+    detach_max_ns: AtomicU64,
 }
 
 impl Default for PipelineStats {
@@ -35,6 +39,9 @@ impl Default for PipelineStats {
             depth_min: AtomicUsize::new(usize::MAX),
             depth_sum: AtomicU64::new(0),
             depth_samples: AtomicU64::new(0),
+            detached: AtomicU64::new(0),
+            detach_ns: AtomicU64::new(0),
+            detach_max_ns: AtomicU64::new(0),
         }
     }
 }
@@ -47,6 +54,14 @@ impl PipelineStats {
         self.pictures.fetch_add(1, Relaxed);
         self.decode_ns.fetch_add(ns, Relaxed);
         self.decode_max_ns.fetch_max(ns, Relaxed);
+    }
+
+    /// A picture was copied out of the driver's buffer in `elapsed`.
+    pub fn detach(&self, elapsed: Duration) {
+        let ns = elapsed.as_nanos() as u64;
+        self.detached.fetch_add(1, Relaxed);
+        self.detach_ns.fetch_add(ns, Relaxed);
+        self.detach_max_ns.fetch_max(ns, Relaxed);
     }
 
     /// The demuxer read `bytes`, waiting `wait_us` in total; its longest
@@ -89,6 +104,9 @@ impl PipelineStats {
             wait_us: self.wait_us.swap(0, Relaxed),
             wait_max_us: self.wait_max_us.swap(0, Relaxed),
             bytes: self.bytes.swap(0, Relaxed),
+            detached: self.detached.swap(0, Relaxed),
+            detach_ns: self.detach_ns.swap(0, Relaxed),
+            detach_max_ns: self.detach_max_ns.swap(0, Relaxed),
             depth_min: (samples > 0).then_some(depth_min),
             depth_mean: (samples > 0).then(|| depth_sum as f64 / samples as f64),
             reads: crate::read_metrics::playback_metrics().map(|m| m.take()),
@@ -104,6 +122,9 @@ pub struct PipelineWindow {
     pub wait_us: u64,
     pub wait_max_us: u64,
     pub bytes: u64,
+    detached: u64,
+    detach_ns: u64,
+    detach_max_ns: u64,
     pub depth_min: Option<usize>,
     pub depth_mean: Option<f64>,
     /// The playing video's read-ahead buffer, if there is one.
@@ -140,6 +161,15 @@ impl std::fmt::Display for PipelineWindow {
         match (self.depth_min, self.depth_mean) {
             (Some(min), Some(mean)) => write!(f, "{min} mean {mean:.1}")?,
             _ => write!(f, "-")?,
+        }
+        if self.detached > 0 {
+            write!(
+                f,
+                ", {} pictures copied out of the driver's buffers in {:.1}/{:.1} ms",
+                self.detached,
+                self.detach_ns as f64 / self.detached as f64 / 1e6,
+                self.detach_max_ns as f64 / 1e6,
+            )?;
         }
         if let Some(reads) = &self.reads {
             write!(f, ", {reads}")?;

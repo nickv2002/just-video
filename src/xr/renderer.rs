@@ -3,11 +3,15 @@
 //! swapchains, and an optional readback of the left eye for screenshots.
 
 use super::context::{XrContext, choose_color_format};
-use crate::media::{Frame, Matrix, PlaneLayout, Transfer};
+use crate::media::{Frame, Matrix, PictureBuffer, PictureMemory, PlaneLayout, Transfer};
 use anyhow::{Context, bail};
 use ash::vk;
 use openxr as xr;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 const SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/video.spv"));
 
@@ -109,6 +113,8 @@ pub struct Renderer {
     pub copy_ms: f64,
     /// Slot and frame serial `precopy` copied into that slot's staging buffer.
     precopied: Option<(usize, u64)>,
+    /// Staging buffers the decode thread copies pictures into.
+    pool: Arc<StagingPool>,
     timestamp_ns: f64,
     gpu_ms: Cell<[f64; 3]>,
 }
@@ -124,6 +130,9 @@ struct Slot {
     /// …and it is a frame (with timestamps).
     frame_in_flight: Cell<bool>,
     staging: Option<Buffer>,
+    /// Pictures this frame's upload reads from the staging pool, kept until
+    /// its fence passes.
+    holding: RefCell<Vec<Arc<dyn PictureBuffer>>>,
     /// Colour conversion uniform, and the descriptor set using it.
     color: Buffer,
     set: vk::DescriptorSet,
@@ -146,6 +155,152 @@ fn find_memory(
                     .contains(wanted)
         })
         .context("No suitable GPU memory type")
+}
+
+/// A host-visible, coherent, persistently mapped buffer.
+fn make_buffer(
+    device: &ash::Device,
+    memory_types: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+) -> anyhow::Result<Buffer> {
+    unsafe {
+        let buffer = device.create_buffer(
+            &vk::BufferCreateInfo::default().size(size).usage(usage),
+            None,
+        )?;
+        let requirements = device.get_buffer_memory_requirements(buffer);
+        let memory_type = find_memory(
+            memory_types,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let memory = device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type),
+            None,
+        )?;
+        device.bind_buffer_memory(buffer, memory, 0)?;
+        let mapped = device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
+        Ok(Buffer {
+            buffer,
+            memory,
+            mapped,
+            size,
+            flags: memory_types.memory_types[memory_type as usize].property_flags,
+        })
+    }
+}
+
+fn free_buffer(device: &ash::Device, buffer: Buffer) {
+    unsafe {
+        device.destroy_buffer(buffer.buffer, None);
+        device.free_memory(buffer.memory, None);
+    }
+}
+
+/// Staging buffers the decode thread fills with pictures (see
+/// [`crate::media::Frame::detach`]) and the renderer uploads from as they are:
+/// the picture is copied once, off the frame loop, and the decoder's own
+/// buffer is free again at once.
+struct StagingPool {
+    device: ash::Device,
+    memory_types: vk::PhysicalDeviceMemoryProperties,
+    free: Mutex<Vec<Buffer>>,
+    /// Set when the renderer is gone: the device may not be used any more.
+    closed: AtomicBool,
+}
+
+// SAFETY: the buffers' mapped pointers are only used by whoever holds the
+// lease; Vulkan object creation and mapping may happen on any thread.
+unsafe impl Send for StagingPool {}
+unsafe impl Sync for StagingPool {}
+
+/// Buffers kept for reuse beyond those in use.
+const STAGING_KEEP: usize = 12;
+
+struct PoolHandle(Arc<StagingPool>);
+
+/// One staging buffer on loan; goes back to its pool when the last holder
+/// (the frame, the GPU work reading it) lets go.
+struct Lease {
+    buffer: Option<Buffer>,
+    pool: Arc<StagingPool>,
+}
+
+// SAFETY: as for `StagingPool`.
+unsafe impl Send for Lease {}
+unsafe impl Sync for Lease {}
+
+impl Lease {
+    fn vk_buffer(&self) -> vk::Buffer {
+        self.buffer.as_ref().expect("lease").buffer
+    }
+}
+
+impl PictureBuffer for Lease {
+    fn ptr(&self) -> *mut u8 {
+        self.buffer.as_ref().expect("lease").mapped
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        if self.pool.closed.load(Ordering::SeqCst) {
+            return; // the device is gone with the renderer; the process is ending
+        }
+        let mut free = self.pool.free.lock().expect("staging pool");
+        if free.len() < STAGING_KEEP {
+            free.push(buffer);
+        } else {
+            drop(free);
+            free_buffer(&self.pool.device, buffer);
+        }
+    }
+}
+
+impl PictureMemory for PoolHandle {
+    fn take(&self, len: usize) -> Option<Arc<dyn PictureBuffer>> {
+        let pool = &self.0;
+        if pool.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+        let reused = {
+            let mut free = pool.free.lock().expect("staging pool");
+            free.iter()
+                .position(|b| b.size as usize >= len)
+                .map(|i| free.swap_remove(i))
+        };
+        let buffer = match reused {
+            Some(buffer) => buffer,
+            None => {
+                // Pictures changed size: the ones kept are the wrong size.
+                let stale: Vec<Buffer> =
+                    std::mem::take(&mut *pool.free.lock().expect("staging pool"));
+                for old in stale {
+                    free_buffer(&pool.device, old);
+                }
+                make_buffer(
+                    &pool.device,
+                    &pool.memory_types,
+                    len as u64,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                )
+                .ok()?
+            }
+        };
+        Some(Arc::new(Lease {
+            buffer: Some(buffer),
+            pool: pool.clone(),
+        }))
+    }
 }
 
 fn plane_format(layout: PlaneLayout, bits: u32, plane: usize) -> vk::Format {
@@ -177,6 +332,16 @@ impl Renderer {
             ctx.vk
                 .get_physical_device_memory_properties(ctx.physical_device)
         };
+        eprintln!(
+            "Renderer: memory types {}",
+            (0..memory_types.memory_type_count as usize)
+                .map(|i| {
+                    let t = memory_types.memory_types[i];
+                    format!("#{i} heap {} {:?}", t.heap_index, t.property_flags)
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
         let color_format = choose_color_format(&ctx.swapchain_formats()?)?;
         unsafe {
             let attachment = [vk::AttachmentDescription::default()
@@ -335,6 +500,7 @@ impl Renderer {
                     in_flight: Cell::new(false),
                     frame_in_flight: Cell::new(false),
                     staging: None,
+                    holding: RefCell::new(Vec::new()),
                     color: Buffer::null(),
                     set,
                 });
@@ -344,7 +510,15 @@ impl Renderer {
                 .get_physical_device_properties(ctx.physical_device)
                 .limits;
 
+            let pool = Arc::new(StagingPool {
+                device: device.clone(),
+                memory_types,
+                free: Mutex::new(Vec::new()),
+                closed: AtomicBool::new(false),
+            });
+            crate::media::set_picture_memory(Some(Arc::new(PoolHandle(pool.clone()))));
             let mut renderer = Self {
+                pool,
                 device,
                 queue: ctx.queue,
                 memory_types,
@@ -464,43 +638,11 @@ impl Renderer {
     }
 
     fn create_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> anyhow::Result<Buffer> {
-        unsafe {
-            let buffer = self.device.create_buffer(
-                &vk::BufferCreateInfo::default().size(size).usage(usage),
-                None,
-            )?;
-            let requirements = self.device.get_buffer_memory_requirements(buffer);
-            let memory_type = find_memory(
-                &self.memory_types,
-                requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )?;
-            let memory = self.device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(requirements.size)
-                    .memory_type_index(memory_type),
-                None,
-            )?;
-            self.device.bind_buffer_memory(buffer, memory, 0)?;
-            let mapped = self
-                .device
-                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())?
-                as *mut u8;
-            Ok(Buffer {
-                buffer,
-                memory,
-                mapped,
-                size,
-                flags: self.memory_types.memory_types[memory_type as usize].property_flags,
-            })
-        }
+        make_buffer(&self.device, &self.memory_types, size, usage)
     }
 
     fn destroy_buffer(&self, buffer: Buffer) {
-        unsafe {
-            self.device.destroy_buffer(buffer.buffer, None);
-            self.device.free_memory(buffer.memory, None);
-        }
+        free_buffer(&self.device, buffer);
     }
 
     fn create_texture(
@@ -612,6 +754,7 @@ impl Renderer {
             self.device.reset_fences(&[slot.fence])?;
         }
         slot.in_flight.set(false);
+        slot.holding.borrow_mut().clear();
         if slot.frame_in_flight.replace(false) {
             let mut stamps = [0u64; TIMESTAMPS as usize];
             // Every query was written in that submission, which has finished.
@@ -755,6 +898,9 @@ impl Renderer {
     /// anyway, rather than within the frame (8K: 3 ms, at worst 10-18 ms).
     /// `begin_frame` then uploads it without copying again.
     pub fn precopy(&mut self, frame: &Frame) -> anyhow::Result<()> {
+        if frame.shared_buffer().is_some() {
+            return Ok(()); // already in a staging buffer
+        }
         self.wait_slot(self.slot)?;
         self.copy_to_staging(frame)?;
         self.precopied = Some((self.slot, frame.serial()));
@@ -812,15 +958,36 @@ impl Renderer {
     /// and `draw_eye`.
     fn record_upload(&mut self, frame: &Frame) -> anyhow::Result<()> {
         self.ensure_video_textures(frame)?;
-        if self.precopied.take() == Some((self.slot, frame.serial())) {
-            self.copy_ms = 0.0;
-        } else {
-            self.copy_to_staging(frame)?;
+        let shared = frame
+            .shared_buffer()
+            .filter(|b| b.as_any().is::<Lease>())
+            .cloned();
+        let source = match &shared {
+            // Copied into a staging buffer by the decode thread already.
+            Some(buffer) => {
+                self.copy_ms = 0.0;
+                buffer
+                    .as_any()
+                    .downcast_ref::<Lease>()
+                    .expect("a lease")
+                    .vk_buffer()
+            }
+            None => {
+                if self.precopied.take() == Some((self.slot, frame.serial())) {
+                    self.copy_ms = 0.0;
+                } else {
+                    self.copy_to_staging(frame)?;
+                }
+                self.slots[self.slot]
+                    .staging
+                    .as_ref()
+                    .expect("staging buffer")
+                    .buffer
+            }
+        };
+        if let Some(buffer) = shared {
+            self.slots[self.slot].holding.borrow_mut().push(buffer);
         }
-        let staging = self.slots[self.slot]
-            .staging
-            .as_ref()
-            .expect("staging buffer");
         let mut regions = Vec::new();
         let mut offset = 0u64;
         for plane in 0..frame.plane_count() {
@@ -851,7 +1018,7 @@ impl Renderer {
             unsafe {
                 self.device.cmd_copy_buffer_to_image(
                     self.cmd(),
-                    staging.buffer,
+                    source,
                     texture.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &[region],
@@ -1227,6 +1394,13 @@ impl Drop for Renderer {
                 }
             }
             self.destroy_texture(&self.dummy);
+            crate::media::set_picture_memory(None);
+            self.pool.closed.store(true, Ordering::SeqCst);
+            let kept: Vec<Buffer> =
+                std::mem::take(&mut *self.pool.free.lock().expect("staging pool"));
+            for buffer in kept {
+                self.destroy_buffer(buffer);
+            }
             let mut buffers = vec![self.readback.take(), self.ui_staging.take()];
             for slot in &mut self.slots {
                 buffers.push(slot.staging.take());

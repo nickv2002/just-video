@@ -254,3 +254,89 @@ are available, and CUBIC cuts its window at every loss. Suggested (needs root, u
 `modprobe tcp_bbr`, `sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr`, then
 compare `read-bench --connections 1`. Also worth checking: the access point's channel, and that the
 headset's retries stay at 0 under load (reported link: -55 dBm, 360 Mbit/s).
+
+## Decode and render smoothness (2026-10-06)
+
+Question: what besides the network makes 8K/high-bitrate playback stutter, and what can be fixed in the
+decode and render path? Measured on the Frame, hardware decoder, muted, 8K HEVC side-by-side file
+(`play` with `JUST_VIDEO_RENDER_UNSEEN=1`, and `bench-seek --play`), alternating runs, 3 rounds unless noted.
+
+**Finding: the driver's few capture buffers starve the decoder.** At 8K the V4L2 decoder has 6 capture
+buffers (12 did not open in one probe, see below). The player held the queue (4), the next and the current
+picture out of the same 6, and the driver needs ~3 as reference pictures. Steady state at 8K: queue depth
+mean 1.0 (min 0), decoder blocked on the frame loop ("decode 16.6 ms" is the pace of playback, not the
+decoder), `capture: nothing decoded in 500 ms (3 of 6 buffers queued in the driver, 3 held by the
+application)` and a 727-740 ms first decode in the first window of 2 of 4 starts. Raising the capture
+buffers (`JUST_VIDEO_CAPTURE_BUFFERS`, a probe, removed again): 6 -> queue mean 1.0, 8 -> 3.0, 10 -> 4.0.
+A decoder with no slack turns any hiccup (a long frame, a 100 ms stall of the frame loop) into a stale picture.
+
+**Measuring it:** `bench-seek --play --hitch-ms 120 --hitch-every 2` blocks the frame loop for 120 ms every
+2 s (14 times in 30 s) and reports the picture's lag behind the clock; `bench-seek` plays at 60 Hz.
+(Skips, ~100 per run, are the loop's own 14 x 7 pictures and the same for every variant.)
+
+| 8K, 30 s, 14 stalls of 120 ms | ticks behind (of 1700) | worst lag | CPU s per 30 s | RSS |
+|---|---|---|---|---|
+| before (6 buffers, queue 4) | 156 / 156 / 160 | 119-120 ms | 18.8-19.3 | 845 MB |
+| 10 capture buffers, queue 4 | 36 / 38 / 39 | 69-71 ms | 19.6-19.8 | 1014 MB |
+| pictures copied to plain memory, queue 4 | 34 / 36 / 39 | 69-70 ms | 43.6-44.1 | 1139 MB |
+| the same, queue 8 | 0 / 0 / 0 | 17 ms | 43.6-44.3 | 1308 MB |
+
+Copying into plain memory and then into the staging buffer (two copies) doubled the CPU time, and the
+two copies are 2 x (44 MB read + 44 MB write) of memory traffic per picture, while 10 capture buffers
+sit 1-2 buffers below the size at which the driver refuses to allocate (12 and 14 fell back to the CPU with
+`Hardware decoder failed to open: Cannot allocate memory`; that probe ran while Steam's web helper held a
+second decoder session, so the exact limit is unproven). Neither is kept.
+
+**Kept: the decode thread copies each hardware picture straight into a renderer-owned staging buffer**
+(`Frame::detach`, `PictureMemory`, `StagingPool` in `renderer.rs`). It is the one copy the frame loop made
+anyway (`copy ahead`), moved to the decode thread, so there is no second copy and no extra CPU. The
+driver's buffer is free again at once, the queue can be 8 deep (130 ms at 60 fps; 8K pictures are 44 MB, so
+about 530 MB of staging memory with the 2 on screen and in flight, and the two per-slot buffers are no longer
+allocated), and the frame loop no longer copies at all. Staging buffers are recycled; the one the GPU
+reads is held by the frame's slot until its fence passes. Without a renderer (`bench-seek`) or with
+`JUST_VIDEO_NO_DETACH=1` frames are held as before; `JUST_VIDEO_DETACH=1` forces a copy into plain memory.
+
+6K HEVC file, real renderer (`play` as the app, `JUST_VIDEO_TEST_HITCH=120,2` stalls the frame loop like
+`--hitch-ms`), 28 s, 3 rounds, steady windows: `copy ahead` (frame loop) 1.67-1.85 ms mean -> 0.00;
+frame-loop thread CPU 384-410 ticks -> 117-138; decode thread 33-39 -> 292-319 ticks; process CPU 14.2-15.3 s
+-> 14.2-15.5 s (queue 4 and 8: the same); decode thread's copy 2.0-2.1 ms mean (max 3.4-14); queue depth
+mean 3.9 -> 7.9 with queue 8; skipped, display periods missed (84) and pictures held 4+ periods (12) identical in
+all variants (the loop's own stalls). Jumps (`bench-seek`, 17 per run, 3 rounds, forced plain-memory copy against
+holding): median 258 / 217 / 214 ms against 207 / 221 / 226 ms, one `-12` replacement per jump either way:
+no change. A 1080p H.264 file plays the same with the staging pool (queue 8, 0.3 ms copies).
+
+**Kept: two copy threads instead of four.** The copy is bound by memory bandwidth, not by cores: 8K into
+plain memory, `bench-seek --play`, 2 rounds: 4 threads 3.1 ms mean / 9.5 s CPU, 2 threads 3.0 ms / 5.1-5.6 s,
+8 threads 3.3 ms / 13.9 s (1 run). In the real renderer at 6K: 14.2-15.3 s -> 9.7-9.8 s CPU per 28 s with the
+same `copy ahead` (1.7 ms); with the staging pool 14.4-15.5 -> 9.5-9.6 s. `JUST_VIDEO_COPY_THREADS=N` compares.
+(1 and 3 threads were not measured: the decoder was unavailable, see below.)
+
+**Negative results**
+- Staging buffers in the `HOST_CACHED` memory type the device offers (Turnip has one next to the
+  uncached one the renderer picks): `copy ahead` 3.30 -> 3.12-3.15 ms (3 rounds, `play`). No change; not kept.
+- Prefetching copy (`prfm` + 64-byte NEON loop) against `memcpy`: 3.2 against 3.1 ms, same CPU. Not kept.
+- `XR_FB_display_refresh_rate` is offered by the runtime, but only `[72.0]` is enumerated and a request for
+  120 Hz returns `ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB`, so the display cannot be matched to the video.
+  At 72 Hz a 60 fps picture is held 1 or 2 display periods (239 / 61 per 5 s window: every fifth picture is
+  doubled), 30 fps 2 or 3 periods: inherent judder that only a 60/90/120 Hz mode (the SteamVR setting) or
+  frame blending would remove. The `Timing:` line now counts how long each picture was held
+  (`pictures held 1/2/3/4+ periods`) and `Display: rates offered` is logged.
+- 4 busy cores (`while :; do :; done` x 4) during 8K playback: nothing changed (0 skipped), so CPU
+  contention from other processes is not what the log shows; thread affinity and priorities were not tried.
+- Capture buffers 12 and 14 (above).
+
+**Logging added:** `copied out of the driver's buffers in MEAN/MAX ms` in the `decoder side:` part,
+`Renderer: memory types ...`, the held-pictures histogram, `JUST_VIDEO_LIST_XR_EXTENSIONS=1`.
+
+**Not proven**
+- The staging pool at 8K in the real renderer: Steam's web helper took a second decoder session
+  (`/proc/<pid>/fd` showed 2 video fds in `steamwebhelper`) during the session, so the 8K file only opened on
+  the CPU (`current session not supported (-12)`) for the last part, and the 8K runs of the pool could not
+  be made. The 8K evidence is the plain-memory variant above (same queue, same effect on the decoder) and
+  the pool at 6K. Run the 8K `play` once with `JUST_VIDEO_NO_DETACH=1` against the default to confirm queue
+  depth ~8 and no `nothing decoded` at the start.
+- Worn-headset behaviour (compositor and GPU load, Wi-Fi), and the 8K startup stall's cause beyond the buffer count.
+- `JUST_VIDEO_TEST_HITCH` (frame loop stalls) and 120 ms are an approximation of a busy compositor.
+- Not tried: importing the driver's DMABUFs into Vulkan (no CPU copy at all; needs the buffers' format
+  modifier and `VK_EXT_image_drm_format_modifier` on Turnip), a separate demux thread (reads do not block
+  the decoder in steady state since the read buffer was resized), frame blending for 60 fps on 72 Hz.

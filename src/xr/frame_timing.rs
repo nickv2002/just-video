@@ -65,6 +65,11 @@ pub struct FrameTiming {
     slow_logged: u32,
     /// What reading and decoding did, reported with each window (see `watch`).
     pipeline: Option<Arc<PipelineStats>>,
+    /// Display periods the picture now on screen has been there, and how
+    /// many pictures stayed 1, 2, 3 or 4+ periods (judder: a video whose
+    /// rate the display rate doesn't divide alternates between two counts).
+    hold: u32,
+    held: [u32; 4],
 }
 
 /// At most this many frames logged one by one per report.
@@ -111,6 +116,16 @@ impl FrameTiming {
                 );
             }
         }
+        let periods = self.last_display.map_or(1, |last| {
+            (((display - last) as f64 / period.max(1) as f64).round() as u32).max(1)
+        });
+        if uploaded {
+            if self.hold > 0 {
+                self.held[self.hold.min(4) as usize - 1] += 1;
+            }
+            self.hold = 0;
+        }
+        self.hold += periods;
         self.previous = std::mem::take(&mut self.current);
         self.last_display = Some(display);
         self.frames += 1;
@@ -146,13 +161,17 @@ impl FrameTiming {
             .unwrap_or_default();
         eprintln!(
             "Timing: frames {} in {:.1} s ({:.0} Hz), {} display periods missed, {} pictures \
-             uploaded, {} skipped; ms mean/max: {}; loop work max {:.1} ms{}",
+             uploaded, {} skipped; pictures held 1/2/3/4+ periods: {}/{}/{}/{}; ms mean/max: {}; loop work max {:.1} ms{}",
             self.frames,
             seconds,
             1e9 / period.max(1) as f64,
             self.missed,
             self.uploads,
             self.skipped,
+            self.held[0],
+            self.held[1],
+            self.held[2],
+            self.held[3],
             phases.join(", "),
             self.busy_max,
             read,
@@ -162,6 +181,7 @@ impl FrameTiming {
             last_display: self.last_display,
             previous: self.previous,
             skipped_total: self.skipped_total,
+            hold: self.hold,
             ..Self::default()
         };
     }

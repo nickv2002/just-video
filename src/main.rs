@@ -270,6 +270,13 @@ enum Command {
         /// taking the headset off: pictures pile up and nothing is let go.
         #[arg(long)]
         idle: Option<f64>,
+        /// With `--play`: block the frame loop for this long (ms) now and then,
+        /// like a busy compositor, to see how the picture catches up.
+        #[arg(long)]
+        hitch_ms: Option<f64>,
+        /// ...every this many seconds.
+        #[arg(long, default_value_t = 2.0)]
+        hitch_every: f64,
         /// Print the full report as JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -2023,6 +2030,8 @@ fn main() -> anyhow::Result<()> {
             jump_every,
             jump_by,
             idle,
+            hitch_ms,
+            hitch_every,
             json,
             read_ahead,
         } => {
@@ -2058,6 +2067,7 @@ fn main() -> anyhow::Result<()> {
                     jump_every,
                     jump_by,
                     idle,
+                    hitch: hitch_ms.map(|ms| (ms, hitch_every)),
                 },
             )?;
             if json {
