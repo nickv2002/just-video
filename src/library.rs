@@ -438,7 +438,7 @@ pub fn file_key(server: &Server, share: &str, path: &Path) -> String {
 }
 
 /// Connections a playing video reads over (see [`SmbSession::open_striped`]).
-pub const VIDEO_CONNECTIONS: usize = 2;
+pub const VIDEO_CONNECTIONS: usize = 4;
 
 /// Connects [`VIDEO_CONNECTIONS`] sessions at once for one video, signed in
 /// straight to `share` (not to the server's IPC$ first: a round trip less);
