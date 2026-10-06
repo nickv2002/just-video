@@ -828,6 +828,7 @@ pub fn run(
                     .filter(|_| !crate::config::near_end(playback.position(), playback.duration));
                 input.wait_for_dpad_release();
                 timing.report(period);
+                timing.watch(None);
                 timing.restart();
                 save_resume(playing_key.as_ref(), &playback);
                 stats.displayed_frames += playback.stats.displayed_frames;
@@ -914,6 +915,7 @@ pub fn run(
                     dialog = None;
                     caption_edit = false;
                     ab_loop.clear();
+                    timing.watch(Some(playback.pipeline()));
                     mode = Mode::Playing(Box::new(playback));
                     input.wait_for_dpad_release();
                     ctx.frame_stream

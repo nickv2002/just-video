@@ -1,6 +1,8 @@
 //! Where the frame loop's time goes while a video plays, logged every few
 //! seconds as `Timing: frames …` (see the headset log).
 
+use super::pipeline_stats::PipelineStats;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
@@ -61,6 +63,8 @@ pub struct FrameTiming {
     previous: [f64; PHASES],
     /// Frames logged one by one (after missed periods) since the last report.
     slow_logged: u32,
+    /// What reading and decoding did, reported with each window (see `watch`).
+    pipeline: Option<Arc<PipelineStats>>,
 }
 
 /// At most this many frames logged one by one per report.
@@ -118,6 +122,12 @@ impl FrameTiming {
         }
     }
 
+    /// Reports the read and decode side of the video now playing with each
+    /// window (None: no video).
+    pub fn watch(&mut self, pipeline: Option<Arc<PipelineStats>>) {
+        self.pipeline = pipeline;
+    }
+
     /// Logs and restarts the counts (nothing when no frames passed).
     pub fn report(&mut self, period: i64) {
         if self.frames == 0 {
@@ -128,9 +138,15 @@ impl FrameTiming {
             .map(|i| format!("{} {:.1}/{:.1}", NAMES[i], self.total[i] / n, self.max[i]))
             .collect();
         let seconds = self.since.map_or(0.0, |s| s.elapsed().as_secs_f64());
+        // Taken on every report, so each window stands alone.
+        let pipeline = self.pipeline.take();
+        let read = pipeline
+            .as_ref()
+            .map(|p| format!("; decoder side: {}", p.take()))
+            .unwrap_or_default();
         eprintln!(
             "Timing: frames {} in {:.1} s ({:.0} Hz), {} display periods missed, {} pictures \
-             uploaded, {} skipped; ms mean/max: {}; loop work max {:.1} ms",
+             uploaded, {} skipped; ms mean/max: {}; loop work max {:.1} ms{}",
             self.frames,
             seconds,
             1e9 / period.max(1) as f64,
@@ -139,8 +155,10 @@ impl FrameTiming {
             self.skipped,
             phases.join(", "),
             self.busy_max,
+            read,
         );
         *self = Self {
+            pipeline,
             last_display: self.last_display,
             previous: self.previous,
             skipped_total: self.skipped_total,

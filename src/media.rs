@@ -63,6 +63,8 @@ impl std::fmt::Display for IoCount {
 struct Counted<S> {
     inner: S,
     count: std::sync::Arc<std::sync::Mutex<IoCount>>,
+    /// The longest single read since it was last taken (microseconds).
+    longest: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Where the next read continues straight on; a read elsewhere is a jump.
     position: u64,
     expected: Option<u64>,
@@ -72,8 +74,11 @@ impl<S: Read> Read for Counted<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let began = std::time::Instant::now();
         let n = self.inner.read(buf)?;
+        let waited = began.elapsed().as_micros() as u64;
+        self.longest
+            .fetch_max(waited, std::sync::atomic::Ordering::Relaxed);
         let mut count = self.count.lock().expect("io count");
-        count.wait_us += began.elapsed().as_micros() as u64;
+        count.wait_us += waited;
         if self.expected != Some(self.position) {
             count.jumps += 1;
         }
@@ -323,6 +328,7 @@ pub struct Media {
     _source: Box<BoxedSource>,
     info: MediaInfo,
     io: std::sync::Arc<std::sync::Mutex<IoCount>>,
+    longest_wait: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 // SAFETY: the FFmpeg contexts are only touched through &mut self.
@@ -331,9 +337,11 @@ unsafe impl Send for Media {}
 impl Media {
     pub fn open(name: &str, source: impl Source + 'static) -> anyhow::Result<Self> {
         let io = std::sync::Arc::new(std::sync::Mutex::new(IoCount::default()));
+        let longest_wait = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let source = Counted {
             inner: source,
             count: io.clone(),
+            longest: longest_wait.clone(),
             position: 0,
             expected: None,
         };
@@ -418,6 +426,7 @@ impl Media {
             raw,
             _source: source,
             io,
+            longest_wait,
             info: MediaInfo {
                 container: text(&r.container),
                 duration_seconds: r.duration_seconds,
@@ -438,6 +447,12 @@ impl Media {
     /// Everything the demuxer has read so far.
     pub fn io(&self) -> IoCount {
         *self.io.lock().expect("io count")
+    }
+
+    /// The longest single read since the last call (microseconds).
+    pub fn take_longest_wait_us(&self) -> u64 {
+        self.longest_wait
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Decodes up to `frames` video frames from the start. `hw_backend` is an
@@ -862,6 +877,11 @@ impl VideoDecoder {
     /// Everything the demuxer has read so far.
     pub fn io(&self) -> IoCount {
         self.media.io()
+    }
+
+    /// The longest single read since the last call (microseconds).
+    pub fn take_longest_wait_us(&self) -> u64 {
+        self.media.take_longest_wait_us()
     }
 
     /// The keyframe in the file's index at or before (or with `after`, at or

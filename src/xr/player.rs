@@ -1,6 +1,7 @@
 //! Video playback state: a decode thread feeding a small queue, and frame
 //! selection by timestamp against the runtime's predicted display time.
 
+use super::pipeline_stats::PipelineStats;
 use super::renderer::EyeParams;
 use crate::media::{Frame, VideoDecoder};
 use crate::subtitles::Cues;
@@ -1061,6 +1062,7 @@ struct DecodeThread {
     /// Set while the decode thread waits for every frame to be dropped, to
     /// replace the decoder (see `replace_decoder`).
     release_frames: Arc<AtomicBool>,
+    pipeline: Arc<PipelineStats>,
 }
 
 /// Media time on screen at an instant, for the current generation; `None`
@@ -1138,6 +1140,9 @@ fn spawn_decoder(
     let on_hardware = back_on_hardware.clone();
     let release_frames = Arc::new(AtomicBool::new(false));
     let release = release_frames.clone();
+    let pipeline = Arc::new(PipelineStats::default());
+    let shared_pipeline = pipeline;
+    let pipeline = shared_pipeline.clone();
     std::thread::Builder::new()
         .name("decode".into())
         .spawn(move || {
@@ -1353,9 +1358,23 @@ fn spawn_decoder(
                         to_keyframe = false;
                     }
                 }
+                let began = Instant::now();
+                let io_before = decoder.io();
+                let result = decoder.next_frame();
+                let took = began.elapsed();
+                let io = decoder.io();
+                let waited = io.wait_us.saturating_sub(io_before.wait_us);
+                pipeline.io(
+                    io.bytes.saturating_sub(io_before.bytes),
+                    waited,
+                    decoder.take_longest_wait_us(),
+                );
                 let mut message = 'failed: {
-                    match decoder.next_frame() {
-                    Ok(Some(frame)) => Decoded::Frame(generation, frame),
+                    match result {
+                    Ok(Some(frame)) => {
+                        pipeline.picture(took, Duration::from_micros(waited));
+                        Decoded::Frame(generation, frame)
+                    }
                     Ok(None) => Decoded::End(generation),
                     // At a jump, the hardware decoder's driver sometimes refuses to
                     // restart (iris: "current session not supported", then busy or
@@ -1535,7 +1554,7 @@ fn spawn_decoder(
                 let mut message = Some(message);
                 while let Some(m) = message.take() {
                     match tx.try_send(m) {
-                        Ok(()) => {}
+                        Ok(()) => pipeline.enqueued(),
                         Err(mpsc::TrySendError::Full(m)) => {
                             if stop.load(Ordering::Relaxed) {
                                 return;
@@ -1582,6 +1601,7 @@ fn spawn_decoder(
         moved_to_cpu,
         back_on_hardware,
         release_frames,
+        pipeline: shared_pipeline,
     }
 }
 
@@ -2155,6 +2175,7 @@ impl Playback {
             self.back_on_hardware = true;
             self.notice(BACK_ON_HARDWARE_NOTICE.into(), Duration::from_secs(4));
         }
+        self.decode.pipeline.sample_depth();
         self.sync_to_audio(now);
         let mut media_time = self.media_time(now);
         *self.shown.lock().expect("shown clock") =
@@ -2162,7 +2183,11 @@ impl Playback {
         let mut changed = false;
         loop {
             if self.next.is_none() && !self.ended {
-                match self.decode.frames.try_recv() {
+                let received = self.decode.frames.try_recv();
+                if received.is_ok() {
+                    self.decode.pipeline.dequeued();
+                }
+                match received {
                     Ok(Decoded::Frame(g, frame)) if g == self.generation => self.next = Some(frame),
                     // Until the target frame starts the clock.
                     Ok(Decoded::Preview(g, frame)) if g == self.generation => {
@@ -2254,6 +2279,11 @@ impl Playback {
     }
 
     /// How the last seek (or the start) went, once its frame was decoded.
+    /// What reading and decoding did, for the timing log.
+    pub fn pipeline(&self) -> Arc<PipelineStats> {
+        self.decode.pipeline.clone()
+    }
+
     pub fn seek_report(&self) -> Option<SeekReport> {
         let report = self.decode.report.lock().expect("seek report");
         report
