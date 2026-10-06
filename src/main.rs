@@ -384,6 +384,10 @@ struct ReadAheadArgs {
     /// Most reads in flight for the self-sizing buffer.
     #[arg(long, default_value_t = just_video::readahead::Adaptive::default().in_flight)]
     buffer_in_flight: usize,
+    /// A read waiting this long (ms) for its block asks again over another
+    /// connection (0: never).
+    #[arg(long, default_value_t = just_video::readahead::HEDGE_FLOOR.as_millis() as u64)]
+    hedge_ms: u64,
 }
 
 /// `read_ahead.connections` sessions to the server in `url` (at least one).
@@ -399,6 +403,9 @@ fn connect_lanes(
 impl ReadAheadArgs {
     /// Applies the buffer policy: as playing does, or the fixed one.
     fn tune(&self, reader: just_video::smb::SmbReader) -> just_video::smb::SmbReader {
+        let reader = reader.with_hedge(
+            (self.hedge_ms > 0).then(|| std::time::Duration::from_millis(self.hedge_ms)),
+        );
         if self.max_in_flight > 0 {
             return reader.with_max_in_flight(self.max_in_flight);
         }

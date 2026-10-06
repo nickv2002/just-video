@@ -10,7 +10,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -24,6 +24,12 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait BlockSource: Send + Sync + 'static {
     /// Reads exactly `len` bytes at `offset` (the reader never asks past the end).
     fn fetch(self: Arc<Self>, offset: u64, len: usize) -> BoxFuture<'static, io::Result<Vec<u8>>>;
+
+    /// Independent paths (connections) requests are spread over. A read left
+    /// waiting can be asked again only if there is more than one.
+    fn lanes(&self) -> usize {
+        1
+    }
 
     /// Releases the remote resource; called once when the reader drops.
     fn close(&self) -> BoxFuture<'_, ()> {
@@ -56,6 +62,8 @@ pub struct ReadStats {
     /// Time the demuxer spent blocked waiting on the network.
     pub stall_seconds: f64,
     pub discarded_blocks: u64,
+    /// Blocks asked for a second time because the first request was slow.
+    pub hedged: u64,
 }
 
 /// How the buffer sizes itself (see [`ReadAheadReader::with_adaptive`]).
@@ -92,6 +100,25 @@ const ADAPTIVE_MAX_BYTES: usize = 160 << 20;
 /// can't be taken back when the reader is left or jumps (4 in flight at once
 /// after a jump measured ~10 % slower jumps, 4 runs each).
 const ADAPTIVE_IN_FLIGHT: usize = 3;
+/// Least time a read waits for a block before asking again (see
+/// `ReadAheadReader::with_hedge`; the time is longer on a slow link).
+pub const HEDGE_FLOOR: Duration = Duration::from_millis(200);
+
+/// [`HEDGE_FLOOR`], or what `JUST_VIDEO_HEDGE_MS` says (0: never ask again),
+/// for comparing on the headset.
+pub fn hedge_floor() -> Option<Duration> {
+    match std::env::var("JUST_VIDEO_HEDGE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(ms)),
+        None => Some(HEDGE_FLOOR),
+    }
+}
+/// A read asks again for a block that took this many times longer than
+/// requests do lately (so a slow link does not double its own load).
+const HEDGE_FACTOR: f64 = 3.0;
 /// A read waiting this long for its block counts as a stall.
 const STALL_SEEN: Duration = Duration::from_millis(150);
 /// Each stall seen in steady reading makes the buffer this much larger…
@@ -150,6 +177,9 @@ pub struct ReadAheadReader<S: BlockSource> {
     /// can send nothing at all.
     detached: Vec<JoinHandle<io::Result<Vec<u8>>>>,
     in_flight: Arc<AtomicUsize>,
+    /// Per requested block: true while its request counts in `in_flight`
+    /// (a request given up on by hedging stops counting at once).
+    counting: BTreeMap<u64, Arc<AtomicBool>>,
     stats: ReadStats,
     /// Asked before a read and while it waits for a block: true makes the
     /// read fail at once (see [`ReadAheadReader::with_cancel`]).
@@ -170,6 +200,9 @@ pub struct ReadAheadReader<S: BlockSource> {
     /// Bytes read and since when, for the rate when the stream's is unknown.
     measured: (Instant, u64),
     measured_rate: f64,
+    /// A read waiting this long (at least; see `hedge_wait`) for a block asks
+    /// again (see `with_hedge`).
+    hedge_after: Option<Duration>,
 }
 
 /// See [`ReadAheadReader::with_cancel`].
@@ -193,6 +226,7 @@ impl<S: BlockSource> ReadAheadReader<S> {
             last_index: None,
             detached: Vec::new(),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            counting: BTreeMap::new(),
             stats: ReadStats::default(),
             cancel: None,
             cancelled: false,
@@ -205,7 +239,19 @@ impl<S: BlockSource> ReadAheadReader<S> {
             target: options.blocks_ahead,
             measured: (Instant::now(), 0),
             measured_rate: 0.0,
+            hedge_after: None,
         }
+    }
+
+    /// A read left waiting for its block asks for it again, after `after` or
+    /// [`HEDGE_FACTOR`] times what a request normally takes (the longer) (the source
+    /// sends the second request over another connection when it has one) and
+    /// takes whichever answer comes first: one flow stalled by loss or a
+    /// timeout no longer holds the video up. Costs one extra block per slow
+    /// block; the slower request is left to finish (never cancelled).
+    pub fn with_hedge(mut self, after: Option<Duration>) -> Self {
+        self.hedge_after = after.filter(|_| self.source.lanes() > 1);
+        self
     }
 
     /// Sizes the buffer by time instead of a count of blocks: it aims to
@@ -318,6 +364,17 @@ impl<S: BlockSource> ReadAheadReader<S> {
             self.blocks.insert(index, Block::Ready(data));
             return;
         }
+        let task = self.start(index);
+        self.blocks.insert(index, Block::Pending(task));
+    }
+
+    /// Requests block `index` from the source now.
+    /// How long a read waits for its block before asking again.
+    fn hedge_wait(&self, floor: Duration) -> Duration {
+        floor.max(self.metrics.typical_latency().mul_f64(HEDGE_FACTOR))
+    }
+
+    fn start(&mut self, index: u64) -> JoinHandle<io::Result<Vec<u8>>> {
         let size = self.options.block_size as u64;
         let offset = index * size;
         let length = size.min(self.len - offset) as usize;
@@ -326,15 +383,18 @@ impl<S: BlockSource> ReadAheadReader<S> {
         let fetch = self.source.clone().fetch(offset, length);
         let in_flight = self.in_flight.clone();
         in_flight.fetch_add(1, Ordering::SeqCst);
+        let counting = Arc::new(AtomicBool::new(true));
+        self.counting.insert(index, counting.clone());
         let metrics = self.metrics.clone();
         let requested = Instant::now();
-        let task = self.runtime.spawn(async move {
+        self.runtime.spawn(async move {
             let result = fetch.await;
             metrics.request_done(requested.elapsed());
-            in_flight.fetch_sub(1, Ordering::SeqCst);
+            if counting.swap(false, Ordering::SeqCst) {
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
             result
-        });
-        self.blocks.insert(index, Block::Pending(task));
+        })
     }
 
     fn in_flight_cap(&self) -> usize {
@@ -384,6 +444,7 @@ impl<S: BlockSource> ReadAheadReader<S> {
             self.stats.discarded_blocks += 1;
         }
         self.detached.retain(|h| !h.is_finished());
+        self.counting.retain(|i, _| self.blocks.contains_key(i));
         // Detached reads count against the window, so seeking around cannot
         // pile up requests; the block needed now is always requested.
         self.metrics.sample(
@@ -442,33 +503,95 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
         let mut retries = 0;
         let mut waited = Duration::ZERO;
         let mut logged = Duration::ZERO;
+        // The second request for this block, once it waited long enough.
+        let mut hedge: Option<JoinHandle<io::Result<Vec<u8>>>> = None;
+        let mut hedged = false;
         loop {
+            let after = self.hedge_after.map(|floor| self.hedge_wait(floor));
+            if let Some(after) = after
+                && !hedged
+                && waited >= after
+                && matches!(self.blocks.get(&index), Some(Block::Pending(_)))
+            {
+                hedged = true;
+                self.stats.hedged += 1;
+                self.metrics.note_hedge();
+                // The slow request no longer holds a place among those in
+                // flight (it is left to finish): the new one takes it.
+                if let Some(slow) = self.counting.get(&index)
+                    && slow.swap(false, Ordering::SeqCst)
+                {
+                    self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
+                hedge = Some(self.start(index));
+            }
             let block = self.blocks.get_mut(&index).expect("scheduled block");
             let Block::Pending(handle) = block else { break };
             let started = Instant::now();
             // Short slices while cancellable, to look at `cancel` between.
-            let slice = if self.cancel.is_some() {
+            let mut slice = if self.cancel.is_some() {
                 CANCEL_POLL
             } else {
                 BLOCK_WAIT
             };
-            let result = self
-                .runtime
-                .block_on(async { tokio::time::timeout(slice, &mut *handle).await });
+            if let Some(after) = after
+                && !hedged
+            {
+                slice = slice.min(after.saturating_sub(waited).max(Duration::from_millis(1)));
+            }
+            let result = self.runtime.block_on(async {
+                tokio::time::timeout(slice, async {
+                    match hedge.as_mut() {
+                        Some(second) => match futures_util::future::select(&mut *handle, second)
+                            .await
+                        {
+                            futures_util::future::Either::Left((r, _)) => (r, false),
+                            futures_util::future::Either::Right((r, _)) => (r, true),
+                        },
+                        None => ((&mut *handle).await, false),
+                    }
+                })
+                .await
+            });
             waited += started.elapsed();
             self.stats.stall_seconds += started.elapsed().as_secs_f64();
             if result.is_err() {
                 if self.cancel.as_ref().is_some_and(|c| c()) {
                     self.cancelled = true;
+                    self.detached.extend(hedge.take());
                     return Err(interrupted());
                 }
-                if waited < logged + BLOCK_WAIT && waited < STALL_LIMIT {
+                // Woke up to ask again (at the top of the loop), or to look at `cancel`.
+                let hedge_pending = !hedged && self.hedge_after.is_some();
+                if hedge_pending || (waited < logged + BLOCK_WAIT && waited < STALL_LIMIT) {
                     continue;
                 }
                 logged = waited;
             }
             match result {
-                Ok(Ok(Ok(data))) => *block = Block::Ready(data),
+                Ok((Ok(Ok(data)), from_hedge)) => {
+                    let first = std::mem::replace(block, Block::Ready(data));
+                    // The slower request is left to finish.
+                    if from_hedge && let Block::Pending(slow) = first {
+                        self.detached.push(slow);
+                    } else {
+                        self.detached.extend(hedge.take());
+                    }
+                }
+                // One of two requests failed: the other may still answer.
+                Ok((failed, from_hedge)) if hedge.is_some() => {
+                    let e = match failed {
+                        Ok(e) => e.err().map(|e| e.to_string()).unwrap_or_default(),
+                        Err(e) => e.to_string(),
+                    };
+                    eprintln!("Read-ahead: a request at {} failed ({e}); the other goes on", self.pos);
+                    let other = hedge.take().expect("second request");
+                    if !from_hedge {
+                        // The first failed: the second takes its place.
+                        *block = Block::Pending(other);
+                    }
+                    // (A failed second request is just dropped.)
+                }
                 // Keep the request running (see `detached`) and keep waiting:
                 // a slow server is better than a broken video.
                 Err(_) if waited < STALL_LIMIT => {
@@ -479,12 +602,13 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
                     );
                 }
                 Err(_) => {
+                    self.detached.extend(hedge.take());
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "The server stopped sending data",
                     ));
                 }
-                Ok(failed) => {
+                Ok((failed, _)) => {
                     self.blocks.remove(&index);
                     let error = match failed {
                         Ok(e) => e.err().unwrap_or_else(|| io::Error::other("read failed")),
@@ -502,6 +626,7 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
                 }
             }
         }
+        self.detached.extend(hedge.take());
         if waited >= STALL_SEEN {
             self.note_stall();
         }
@@ -1094,5 +1219,100 @@ mod tests {
         let mut r = spiky_reader(10, 0..0);
         r.metrics().set_rate_hint(1_000_000);
         assert_eq!(r.target_blocks(), 32);
+    }
+
+    /// Two connections; the first request for one block is held back for a
+    /// second (a flow stalled by loss), the second request is quick.
+    struct Hedgy {
+        data: Vec<u8>,
+        asked: std::sync::Mutex<Vec<u64>>,
+        fail_first: bool,
+    }
+
+    impl BlockSource for Hedgy {
+        fn lanes(&self) -> usize {
+            2
+        }
+
+        fn fetch(
+            self: Arc<Self>,
+            offset: u64,
+            len: usize,
+        ) -> BoxFuture<'static, io::Result<Vec<u8>>> {
+            Box::pin(async move {
+                let first = {
+                    let mut asked = self.asked.lock().unwrap();
+                    asked.push(offset);
+                    asked.iter().filter(|&&o| o == offset).count() == 1
+                };
+                if offset == 5 * BLOCK as u64 && first {
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    if self.fail_first {
+                        return Err(io::Error::other("connection reset"));
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Ok(self.data[offset as usize..offset as usize + len].to_vec())
+            })
+        }
+    }
+
+    fn hedgy_reader(hedge: Option<u64>, fail_first: bool) -> (ReadAheadReader<Hedgy>, Vec<u8>) {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_time()
+                .build()
+                .unwrap(),
+        );
+        let data: Vec<u8> = (0..10 * BLOCK).map(|i| (i % 251) as u8).collect();
+        let source = Hedgy {
+            data: data.clone(),
+            asked: Default::default(),
+            fail_first,
+        };
+        let options = ReadAhead {
+            block_size: BLOCK,
+            blocks_ahead: 4,
+        };
+        let r = ReadAheadReader::new(runtime, source, data.len() as u64, options)
+            .with_hedge(hedge.map(Duration::from_millis));
+        (r, data)
+    }
+
+    #[test]
+    fn a_slow_block_is_asked_again_and_the_first_answer_wins() {
+        let (mut r, data) = hedgy_reader(Some(100), false);
+        let started = Instant::now();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        let took = started.elapsed();
+        assert_eq!(got, data);
+        assert!(took < Duration::from_millis(600), "took {took:?}");
+        assert_eq!(r.stats().hedged, 1);
+
+        // Without it the reader waits out the slow request.
+        let (mut r, _) = hedgy_reader(None, false);
+        let started = Instant::now();
+        std::io::copy(&mut r, &mut std::io::sink()).unwrap();
+        assert!(started.elapsed() > Duration::from_millis(900));
+        assert_eq!(r.stats().hedged, 0);
+    }
+
+    #[test]
+    fn a_failed_first_request_does_not_spoil_the_second() {
+        let (mut r, data) = hedgy_reader(Some(100), true);
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+        assert_eq!(r.stats().hedged, 1);
+    }
+
+    #[test]
+    fn one_connection_never_hedges() {
+        let mut single = spiky_reader(4, 0..0).with_hedge(Some(Duration::from_millis(10)));
+        assert!(single.hedge_after.is_none());
+        std::io::copy(&mut single, &mut std::io::sink()).unwrap();
     }
 }
