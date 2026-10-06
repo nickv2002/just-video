@@ -109,3 +109,69 @@ count is the decoder not keeping ahead.
   side` figures in the log tell network (read wait longest) from decoder (decode max, queue depth
   min 0 with little read wait).
 - Found on the way: a video started from the command line (`play`) did not get the new figures (fixed).
+
+## Decoder recovery (2026-10-05)
+
+Report: playing the 8K HEVC side-by-side file on the iris hardware decoder, the log showed
+`capture: nothing decoded in 500 ms (3 of 6 buffers queued in the driver, 3 held by the application)`
+about 8 times, `Hardware decoder returned no picture for 3004 ms`, `Decoder: 3 frames still held;
+replacing it anyway`, and then on every jump a run of `Decoder failed (... -12); replaced in ~350 ms`
+(`output VIDIOC_REQBUFS failed`, `can't configure decoder`), ending on the CPU (`Playing on the CPU`)
+and back on the hardware a moment later.
+
+**Cause.** The old session lives as long as one of its frames does (FFmpeg's V4L2 buffers
+hold the context), and iris refuses a second 8K session beside it (`current session not
+supported`, -12). The player drops its frames (`current`, `next`, the queue) only inside
+`Playback::advance`, which the frame loop does not call when the OpenXR session is not rendering
+(`should_render` false, or no running session): both failure runs in the headset log start
+right after `OpenXR session: VISIBLE` then `SYNCHRONIZED` (headset off), and `Playing on the CPU`
+(printed from `advance`) only appears after `FOCUSED`. With the loop stopped, the 3 held pictures
+left the 6-buffer 8K decoder too few to decode into, so it returned nothing; 3 s later the
+replacement started, waited its 300 ms for frames nobody would drop (the 350 ms), opened a
+second session next to the first, was refused, and tried again twice more, the last on the CPU.
+The one replacement in the log that took 28 ms (a failed flush at a jump, while rendering) is the
+ordinary kind and is unchanged.
+
+**Reproduced headlessly:** `bench-seek --idle N` (new) stops ticking `advance` for N seconds before each jump.
+With 6 s the old build printed the headset log's sequence exactly (8-11 `nothing decoded`, `no picture
+for 3004 ms`, `3 frames still held`, `-12`, `REQBUFS failed`, `Playing on the CPU`). Plain
+`bench-seek` can't show it: it ticks `advance` all the time, so frames are always released.
+
+**Changes.**
+- The frame loop calls `Playback::keep_flowing` when it isn't drawing (headset off: takes the
+  pictures that fall due, as drawing would; no session: only lets frames go on request), so the
+  decoder keeps its buffers and nothing is replaced.
+- A `Pulse` beaten by the frame loop tells the decode thread whether the consumer runs.
+  `replace_decoder` (now over a small `Session` trait, with a mock in the tests) waits for a silent
+  frame loop (up to 30 s) instead of racing it, and does not free-behind while frames are held;
+  a running loop that still holds frames after 300 ms is leaking them, as before.
+- A stall (`DecoderStalled`, a typed error) with a silent frame loop and frames held is waited out
+  (`judge_stall`), not counted as a dead decoder, so it no longer costs restarts or the CPU.
+- A decoder that returns nothing mid-playback (a picture decoded since the jump, the clock
+  running, the frame loop drawing) is judged dead after 1.5 s instead of 3 s. Time spent reading
+  doesn't count (the limit is on the wait inside the decoder only), so a stalled network read isn't
+  taken for a dead decoder. Right after a jump the limit stays 3 s.
+- Tests: the old session closes before the new opens; a silent frame loop is waited for; leaked
+  frames don't hang the replacement; stop ends the wait; the CPU is used only after the hardware
+  failed each time.
+
+**Measured** (headset, 8K HEVC side-by-side file on the hardware decoder, muted, iris `CORE_INIT`,
+17 jumps per run, 3 runs each alternating old/new, `bench-seek --random 10 --from 600 --idle 8`;
+the old build is this commit's parent plus the `--idle` option):
+
+| | jump shown, median of run medians | `-12` per run | `frames still held` | on the CPU | run |
+|---|---|---|---|---|---|
+| old | 536 ms (527, 536, 582; worst jump 2.5-2.8 s) | 10 | 12 | 2 times, 4 software opens | fails (a jump without a picture) |
+| new | 270.5 ms (272, 257, 271; worst 436-484 ms) | 0, 0, 1 | 0 | never | passes |
+
+With `--idle 4` (stall near the end of the idle) the old build was luckier, 341 ms vs 288 ms,
+and in one of three runs went to the CPU and then crashed (SIGSEGV after `Playing on the CPU`,
+kernel WARN in `vb2_start_streaming`); not seen with the new build. The new build prints
+`Decoder: no picture while the frame loop is stopped; waiting for it` 14-15 times per run and
+resumes with no replacement. Without idling (4 alternating runs each, 17 jumps): 287 ms old, 271 ms
+new, no `-12` except the ordinary one failed flush in one old run, no false stall; 40 s steady
+play at 60 Hz: 2396-2397 of 2398 pictures shown on both.
+
+Not measured: a real headset taken off and put on (the app change that makes the frame loop
+keep taking pictures is in `app.rs` and only exercised by reasoning and the bench stand-in);
+Steam's web helper holding a session (`/proc/*/fd` showed none holding the decoder during the runs).
