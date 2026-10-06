@@ -12,6 +12,9 @@ samples = [
     if line.startswith("sample") and "rss_kib=" in line and "rss_kib= " not in line
 ]
 lines = log.splitlines()
+for l in samples_text.splitlines():
+    if l.startswith("netem"):
+        print(l)
 
 
 def total(pattern, group=1):
@@ -48,7 +51,7 @@ if seeks:
 print(f"decoder events     failed {count(r'Decoder failed')}, replaced {count(r'replaced in')}, "
       f"CPU fallback {count(r'Playing on the CPU')}, still held {count(r'still held')}, "
       f"nothing decoded {count(r'nothing decoded')}, no picture {count(r'no picture for')}, "
-      f"waiting while stopped {count(r'frame loop is stopped')}, seek failed {count(r'Seek to .* failed')}, "
+      f"waiting while stopped {count(r'frame loop is stopped')}, waiting while paused {count(r'while paused')}, seek failed {count(r'Seek to .* failed')}, "
       f"replace failed {count(r'Replacing the decoder')}")
 print(f"other              errors {count(r'(?i)^error|panick|SIGSEGV')}, audio nearly dry windows "
       f"{count(r'[1-9]\d* nearly dry')}, script actions {count(r'^Script:')}")

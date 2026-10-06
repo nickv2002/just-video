@@ -254,3 +254,67 @@ are available, and CUBIC cuts its window at every loss. Suggested (needs root, u
 `modprobe tcp_bbr`, `sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr`, then
 compare `read-bench --connections 1`. Also worth checking: the access point's channel, and that the
 headset's retries stay at 0 under load (reported link: -55 dBm, 360 Mbit/s).
+
+## Soak and degraded-link runs of the real player (2026-10-05, night 2)
+
+Tool: `scripts/frame-soak.sh` (locks the shared headset, mutes it, runs `play` with
+`JUST_VIDEO_RENDER_UNSEEN=1` so the real frame loop and renderer run with nobody wearing it,
+samples RSS / threads / open files every 10 s, and `scripts/soak-summary.py` condenses the
+`Timing:` lines). `JUST_VIDEO_SCRIPT="60:pause 66:pause 90:jump+300 150:loop 160:loop 200:off
+235:on ..."` (`src/xr/script.rs`) drives pause, jumps, the A-B button and a simulated
+headset-off/on from inside the frame loop. `--netem` shapes only what the headset sends to the
+server (a prio qdisc plus a filter on the server's address on `wlan0`, so ssh stays alone; the
+headset kernel has no `ifb`, so the server's own packets can't be delayed or dropped; the loss
+hits requests and ACKs); the qdisc is removed on exit. Note `play --duration` counts media
+seconds, and a jump past the end of the file ends the run.
+
+**Bug found and fixed: pausing killed the hardware decoder.** Paused, the held pictures
+(current, next, a queue of 4) fill the 6 buffers of the hardware decoder; it returns nothing
+(`capture: nothing decoded in 500 ms (... 5 held by the application)`), and after 1.5-3 s that was
+judged a dead decoder: replaced (`Decoder failed (... -110)`), and in the same run a second
+pause, 15 s long, ended in `Playing on the CPU` (8K on the CPU cannot keep up). Every pause of
+6 s or more did this. Now a stall while the user has paused (a flag set by `toggle_pause`) waits for
+resume or the next jump (`Decoder: no picture while paused; waiting for resume`).
+Before: 2 of 2 long pauses replaced the decoder, one reached the CPU. After: 0 replacements in 5
+runs with pauses of 6-25 s (4 runs on the 8K file, 1 on the 6K file), no CPU fallback, jumps
+while paused work, resume continues at once. Test: `judge_stall` and `wait_while_paused` cases.
+
+**Soak results (headset, hardware decoder, muted, nothing worn):**
+
+| run | length | skipped / uploaded | longest read wait | RSS | threads / fds | decoder |
+|---|---|---|---|---|---|---|
+| 8K, 20 jumps, 3 pauses, 6 A-B loops, 2 headset off/on | 10 min | 1 / 31702 | 117 ms | flat at 1.17-1.2 GB (59 MiB buffer aimed), -0.0 MiB/min after minute 1 | 17-22 / 97-152, steady | 19 replacements (one per jump, -12), 0 CPU |
+| 6K, 18 jumps, 4 pauses, A-B, 4 off/on | 9 min | 13 / 30133 | 213 ms | 0.74 -> 1.09 GB, +0.3 MiB/min | 17-22 / 97-152 | 17 replacements (24-29 ms), 0 CPU |
+
+No leaks: RSS, threads and descriptors stay flat across jumps, pauses, loops and head off/on
+(RSS drops to ~0.6 GB while the headset is "off" and comes back). Jump ready times: median 303 ms
+(8K), 210 ms (6K). The failed flush at every jump (iris `-12`, replaced in 68-90 ms on 8K, 24-29 ms
+on 6K) is the known one (see Dead ends): it happens on every jump while playing at 60 fps.
+A-B loop: 4 consecutive loops of the same 10 s section each cost 215-235 ms and never failed.
+
+**Wi-Fi trouble (8K, `--netem` on the headset's requests and ACKs):**
+
+- Outage of 5 s (100 % loss for 5 s): invisible (buffer 87 -> 47 MiB, no skipped picture).
+- 8 s: buffer drained to 8 MiB, a request waited the SMB 10 s timeout (`Read-ahead: retrying read`),
+  41 pictures skipped and one 1 s freeze after the link came back.
+- 15 s: the picture froze for ~10 s after the link was back (windows of 301, 77, 0 and 236 pictures),
+  4 reads retried after 10 s, and a jump during it took 1978 ms; playback then recovered fully, no
+  decoder event. The wait after the link returns is TCP's retransmission back-off on the stuck
+  connections, which a retry on the same connection does not shorten; a new connection after a
+  few seconds without data would (not done: risk of reconnect storms on a slow-but-alive link).
+- 3 % loss + 60 +/- 30 ms for 60 s: no skipped pictures, request time p99 up to 1.1 s, buffer stayed
+  at 153 of 156 MiB.
+- 2 % loss + 40 +/- 20 ms for the whole run: the first 15 s skipped 192 pictures (the buffer starts
+  empty and the link carries little more than the stream), read wait up to 4.5 s per window, the
+  aim grew to its 160 MiB cap; after that smooth except 3-5 skipped pictures and 100-200 ms of
+  waiting after each jump. Skipped 199 of 14205 in 4.2 min.
+
+**Cold open (bench-seek `--resume` on the 8K file, 3 runs, app's own open path):** connect 118-124 ms
+(300 ms the first time), open file 5 ms, probe 167-179 ms (3 sequential round trips, 3.2 MiB),
+decoder 16-20 ms, then the first frame 290-310 ms after open (2.5 MiB keyframe read at the link's
+speed plus the decode): 480-510 ms from the request to the first picture (1.2 s when the NAS had
+the file cold). The slowest phase is the first frame, and it is bandwidth, not code: nothing safe
+to trim (the earlier notes already cover the other candidates).
+
+Not measured: a real headset worn (compositor busy), Steam's helper holding a decoder session, the
+server's side of a Wi-Fi drop (only the headset's sends were shaped).
