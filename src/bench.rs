@@ -95,6 +95,8 @@ pub struct Options {
     /// While playing: jump `jump_by` seconds this often (seconds), like D-pad presses.
     pub jump_every: Option<f64>,
     pub jump_by: f64,
+    /// Before each jump: no frame loop ticks for this long (seconds).
+    pub idle: Option<f64>,
 }
 
 /// Steady playback, as the headset's frame loop sees it.
@@ -378,6 +380,10 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
         let from = options.from.min(duration * 0.5);
         let mut jump = |playback: &mut Playback, label: &str, target: f64| {
             let from = playback.position();
+            if let Some(idle) = options.idle {
+                // The headset is off: nothing draws, so nothing calls `advance`.
+                std::thread::sleep(Duration::from_secs_f64(idle));
+            }
             let since = Instant::now();
             playback.seek(target);
             let (shown_ms, preview_ms) = wait_shown(playback, since);
