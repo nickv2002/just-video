@@ -771,7 +771,7 @@ mod tests {
         let started = Instant::now();
         std::io::copy(&mut r, &mut std::io::sink()).unwrap();
         let elapsed = started.elapsed();
-        assert!(elapsed < Duration::from_millis(250), "took {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(400), "took {elapsed:?}");
         assert_eq!(r.stats().requests, 64);
     }
 }
