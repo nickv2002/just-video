@@ -97,6 +97,8 @@ pub struct Options {
     pub jump_by: f64,
     /// Before each jump: no frame loop ticks for this long (seconds).
     pub idle: Option<f64>,
+    /// While playing: block the loop for `.0` ms every `.1` seconds.
+    pub hitch: Option<(f64, f64)>,
 }
 
 /// Steady playback, as the headset's frame loop sees it.
@@ -113,6 +115,10 @@ pub struct PlayReport {
     pub skipped: u64,
     /// Ticks showing a picture more than 1.5 frames older than the clock.
     pub behind_ticks: u64,
+    /// The most the picture shown lagged the clock (ms).
+    pub lag_max_ms: f64,
+    /// Frame loop stalls made (`--hitch-ms`).
+    pub hitches: u64,
     pub ticks: u64,
     /// Ticks that took longer than a refresh period (loop work only).
     pub over_budget_ticks: u64,
@@ -173,6 +179,7 @@ fn play_steady(
     hz: f64,
     jump_every: Option<f64>,
     jump_by: f64,
+    hitch: Option<(f64, f64)>,
 ) -> PlayReport {
     let period = Duration::from_secs_f64(1.0 / hz);
     let clock = Instant::now();
@@ -187,7 +194,19 @@ fn play_steady(
     let first_time = playback.media_time(now_ns());
     let mut next_tick = Instant::now();
     let mut next_jump = jump_every.map(|s| clock + Duration::from_secs_f64(s));
+    // Block the loop now and then, like a busy compositor does.
+    let hitch_every = Duration::from_secs_f64(hitch.map_or(1.0, |h| h.1.max(0.1)));
+    let hitch = hitch.map(|h| Duration::from_secs_f64(h.0 / 1e3));
+    let mut next_hitch = clock + hitch_every;
     while clock.elapsed().as_secs_f64() < seconds {
+        if let Some(stall) = hitch
+            && Instant::now() >= next_hitch
+        {
+            std::thread::sleep(stall);
+            r.hitches += 1;
+            next_hitch = Instant::now() + hitch_every;
+            next_tick = Instant::now();
+        }
         if let (Some(at), Some(every)) = (next_jump, jump_every)
             && Instant::now() >= at
         {
@@ -212,9 +231,11 @@ fn play_steady(
         if let (Some(t), Some(pts)) = (
             playback.media_time(now),
             playback.current().and_then(|f| f.pts()),
-        ) && t - pts > 1.5 / r.fps
-        {
-            r.behind_ticks += 1;
+        ) {
+            r.lag_max_ms = r.lag_max_ms.max((t - pts) * 1e3);
+            if t - pts > 1.5 / r.fps {
+                r.behind_ticks += 1;
+            }
         }
         r.ticks += 1;
         if tick.elapsed() > period {
@@ -375,6 +396,7 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
             options.hz,
             options.jump_every,
             options.jump_by,
+            options.hitch,
         ));
     } else if first_frame_ms.is_some() && options.resume.is_none() {
         let from = options.from.min(duration * 0.5);
@@ -480,7 +502,7 @@ pub fn summary(r: &Report) -> String {
     if let Some(p) = &r.play {
         out += &format!(
             "played {:.1} s at {:.0} Hz: {} of {} frames shown, {} skipped, {} of {} ticks behind, {} over budget\n\
-             copy {:.1} ms mean / {:.1} max ({:.0} MB/s), advance {:.2} ms mean / {:.1} max\n",
+             copy {:.1} ms mean / {:.1} max ({:.0} MB/s), advance {:.2} ms mean / {:.1} max, picture lagged the clock by up to {:.0} ms, {} loop stalls\n",
             p.seconds,
             p.hz,
             p.shown,
@@ -494,6 +516,8 @@ pub fn summary(r: &Report) -> String {
             p.copy_mb_per_s,
             p.advance_ms_mean,
             p.advance_ms_max,
+            p.lag_max_ms,
+            p.hitches,
         );
         if p.jumps > 0 {
             out += &format!("{} jumps of +5 s while playing\n", p.jumps);

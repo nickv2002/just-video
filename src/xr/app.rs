@@ -703,6 +703,18 @@ pub fn run(
     let mut script = super::script::Script::from_env();
     let script_start = Instant::now();
     let mut script_off = false;
+
+    // Test aid ("120,2"): block the loop for 120 ms every 2 s, as a busy
+    // compositor or CPU does, to see how the picture catches up.
+    let test_hitch: Option<(Duration, Duration)> =
+        std::env::var("JUST_VIDEO_TEST_HITCH").ok().and_then(|v| {
+            let (ms, every) = v.split_once(',')?;
+            Some((
+                Duration::from_secs_f64(ms.parse::<f64>().ok()? / 1e3),
+                Duration::from_secs_f64(every.parse().ok()?),
+            ))
+        });
+    let mut last_hitch = Instant::now();
     let mut timing = FrameTiming::default();
     if let Mode::Playing(playback) = &mode {
         timing.watch(Some(playback.pipeline()));
@@ -735,6 +747,13 @@ pub fn run(
                         xr::SessionState::READY => {
                             ctx.session.begin(VIEW_TYPE)?;
                             running = true;
+                            if !ctx.refresh_rates.is_empty() {
+                                eprintln!(
+                                    "Display: rates offered {:?}, now {:?}",
+                                    ctx.refresh_rates,
+                                    ctx.session.get_display_refresh_rate().ok()
+                                );
+                            }
                         }
                         xr::SessionState::STOPPING => {
                             ctx.session.end()?;
@@ -744,6 +763,11 @@ pub fn run(
                         _ => {}
                     }
                 }
+                xr::Event::DisplayRefreshRateChangedFB(e) => eprintln!(
+                    "Display: rate changed from {} to {} Hz",
+                    e.from_display_refresh_rate(),
+                    e.to_display_refresh_rate()
+                ),
                 xr::Event::InstanceLossPending(_) => break 'main,
                 xr::Event::InteractionProfileChanged(_) => input.log_profiles(&ctx),
                 _ => {}
@@ -791,6 +815,13 @@ pub fn run(
         }
         period = state.predicted_display_period.as_nanos();
         stats.rendered_xr_frames += 1;
+        if let Some((stall, every)) = test_hitch
+            && last_hitch.elapsed() >= every
+            && matches!(mode, Mode::Playing(_))
+        {
+            std::thread::sleep(stall);
+            last_hitch = Instant::now();
+        }
         let now = state.predicted_display_time.as_nanos();
         let dt = state.predicted_display_period.as_nanos() as f32 / 1e9;
         set_phase(2);
@@ -1743,8 +1774,7 @@ pub fn run(
     if let Mode::Playing(playback) = mode {
         // Written here, not in the background: the app is about to exit.
         if let Some(key) = &playing_key
-            && let Err(e) =
-                crate::config::save_stop(key, playback.position(), playback.duration)
+            && let Err(e) = crate::config::save_stop(key, playback.position(), playback.duration)
         {
             eprintln!("Can't save where the video was left: {e:#}");
         }

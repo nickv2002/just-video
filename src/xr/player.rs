@@ -1582,6 +1582,10 @@ impl Behind {
     }
 }
 
+/// Decoded hardware pictures waiting for the frame loop (at 60 fps, 8 are
+/// 130 ms of slack; 8K pictures are 44 MB each).
+const HARDWARE_QUEUE: usize = 8;
+
 fn spawn_decoder(
     mut decoder: VideoDecoder,
     start: f64,
@@ -1592,8 +1596,24 @@ fn spawn_decoder(
 ) -> DecodeThread {
     let (subtitle_track, subtitle_changes) = mpsc::channel::<Option<usize>>();
     let (audio_track, audio_changes) = mpsc::channel::<usize>();
-    // A few frames of slack absorb decode jitter; more would only cost memory.
-    let (tx, frames) = mpsc::sync_channel(4);
+    // Slack absorbs decode jitter, a stalled frame loop and lets the decoder
+    // run ahead. Hardware pictures are copied out of the driver's few buffers
+    // (see `Frame::detach`), so a deep queue costs only memory (the renderer's
+    // staging buffers); software pictures stay as they are, a few frames.
+    let queue = std::env::var("JUST_VIDEO_QUEUE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if decoder.stats().hw_backend.is_some() {
+            HARDWARE_QUEUE
+        } else {
+            4
+        });
+    // JUST_VIDEO_NO_DETACH: hold the driver's buffers as before, to compare.
+    // JUST_VIDEO_DETACH: copy into plain memory without a renderer (bench-seek).
+    let no_detach = std::env::var_os("JUST_VIDEO_NO_DETACH").is_some();
+    let force_detach = std::env::var_os("JUST_VIDEO_DETACH").is_some();
+    let pool = crate::media::FramePool::default();
+    let (tx, frames) = mpsc::sync_channel(queue);
     let (control, commands) = mpsc::channel::<SeekRequest>();
     let requested = Arc::new(AtomicU64::new(0));
     let pending = requested.clone();
@@ -2053,6 +2073,17 @@ fn spawn_decoder(
                             }
                         }
                     }
+                }
+                // A hardware frame holds one of the driver's few buffers:
+                // copy it out so the decoder is free to go on.
+                if !no_detach
+                    && (force_detach || crate::media::has_picture_memory())
+                    && let Decoded::Frame(_, frame) | Decoded::Preview(_, frame) = &mut message
+                    && frame.hardware()
+                {
+                    let copied = Instant::now();
+                    *frame = frame.detach(&pool);
+                    pipeline.detach(copied.elapsed());
                 }
                 let preview = matches!(message, Decoded::Preview(..));
                 let finished = !matches!(message, Decoded::Frame(..) | Decoded::Preview(..));

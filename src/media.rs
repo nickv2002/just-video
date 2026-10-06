@@ -4,7 +4,7 @@ use crate::vr::{Layout, Projection, Stereo};
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::{
@@ -622,13 +622,80 @@ pub struct Frame {
     raw: RawFrame,
     /// Unique among the process's frames (see [`Frame::serial`]).
     serial: u64,
-    /// The decoder's count of frames alive (see [`VideoDecoder::frames_alive`]).
-    alive: Arc<AtomicUsize>,
+    /// The decoder's count of frames alive (see [`VideoDecoder::frames_alive`]);
+    /// none for a detached frame, which holds no decoder buffer.
+    alive: Option<Arc<AtomicUsize>>,
+    /// Set for a detached frame: its pixels (see [`Frame::detach`]).
+    owned: Option<Owned>,
+}
+
+/// Where a detached frame's pixels live.
+enum Owned {
+    /// An ordinary host buffer, going back to its pool.
+    Heap(Vec<u8>, FramePool),
+    /// Memory the renderer drew from directly (see [`PictureMemory`]).
+    Shared(Arc<dyn PictureBuffer>),
+}
+
+/// A mapped buffer a decoded picture was copied into, held by the frame and
+/// by whatever still reads it (the GPU), and recycled when none does.
+pub trait PictureBuffer: Send + Sync {
+    fn ptr(&self) -> *mut u8;
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// Memory the decode thread copies pictures into, owned by the renderer so it
+/// can use them without copying again.
+pub trait PictureMemory: Send + Sync {
+    /// A buffer of at least `len` bytes, or None to use ordinary memory.
+    fn take(&self, len: usize) -> Option<Arc<dyn PictureBuffer>>;
+}
+
+static PICTURE_MEMORY: Mutex<Option<Arc<dyn PictureMemory>>> = Mutex::new(None);
+
+/// Whether the renderer offers memory for detached pictures (it does while it runs).
+pub fn has_picture_memory() -> bool {
+    PICTURE_MEMORY.lock().expect("picture memory").is_some()
+}
+
+/// Where `Frame::detach` puts pictures from now on (None: ordinary memory).
+pub fn set_picture_memory(memory: Option<Arc<dyn PictureMemory>>) {
+    *PICTURE_MEMORY.lock().expect("picture memory") = memory;
 }
 
 // SAFETY: the frame's buffers are reference counted by FFmpeg and immutable
-// once decoded; freeing from another thread is allowed.
+// once decoded; freeing from another thread is allowed. A detached frame's
+// pointers point into its own heap buffer.
 unsafe impl Send for Frame {}
+
+/// Most buffers a [`FramePool`] keeps for reuse.
+const POOL_KEEP: usize = 16;
+
+/// Recycled host buffers for detached frames: an 8K picture is 44 MB, and a
+/// fresh one per picture would be mapped and page-faulted every time.
+#[derive(Clone, Default)]
+pub struct FramePool(Arc<Mutex<Vec<Vec<u8>>>>);
+
+impl FramePool {
+    fn take(&self, len: usize) -> Vec<u8> {
+        let mut free = self.0.lock().expect("frame pool");
+        match free.iter().position(|b| b.len() >= len) {
+            Some(i) => free.swap_remove(i),
+            // Zeroed lazily by the kernel: pages are touched by the copy.
+            None => {
+                free.clear();
+                vec![0u8; len]
+            }
+        }
+    }
+
+    fn give(&self, buffer: Vec<u8>) {
+        let mut free = self.0.lock().expect("frame pool");
+        if free.len() < POOL_KEEP {
+            free.push(buffer);
+        }
+    }
+}
 
 /// The next [`Frame::serial`].
 static FRAME_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -689,6 +756,64 @@ impl Frame {
         self.raw.hardware != 0
     }
 
+    /// Copies this picture into a host buffer from `pool` and returns it as
+    /// a frame of its own. The decoder's buffer is free again once this
+    /// frame is dropped, however long the copy is kept: a V4L2 decoder has
+    /// only a handful of them (6 at 8K), and what the player holds back
+    /// (the queue, the picture on screen and the next one) comes out of
+    /// the same few.
+    pub fn detach(&self, pool: &FramePool) -> Frame {
+        let len = self.packed_len();
+        let shared = PICTURE_MEMORY
+            .lock()
+            .expect("picture memory")
+            .clone()
+            .and_then(|memory| memory.take(len));
+        let (base, owned) = match shared {
+            Some(buffer) => {
+                // SAFETY: the buffer is mapped, holds `len` bytes, and nobody
+                // else writes it until it has gone back to its pool.
+                let to = unsafe { std::slice::from_raw_parts_mut(buffer.ptr(), len) };
+                self.copy_to(to);
+                (buffer.ptr().cast_const(), Owned::Shared(buffer))
+            }
+            None => {
+                let mut buffer = pool.take(len);
+                self.copy_to(&mut buffer);
+                (buffer.as_ptr(), Owned::Heap(buffer, pool.clone()))
+            }
+        };
+        let mut raw = RawFrame {
+            handle: std::ptr::null_mut(),
+            data: [std::ptr::null(); 3],
+            linesize: [0; 3],
+            ..self.raw
+        };
+        let mut offset = 0usize;
+        for plane in 0..self.plane_count() {
+            let (w, h, c) = self.plane_size(plane);
+            let row_bytes = (w * c) as usize * self.bytes_per_sample();
+            // SAFETY: inside the buffer, which holds every plane's rows packed.
+            raw.data[plane] = unsafe { base.add(offset) };
+            raw.linesize[plane] = row_bytes as i32;
+            offset += row_bytes * h as usize;
+        }
+        Frame {
+            raw,
+            serial: FRAME_SERIAL.fetch_add(1, Ordering::Relaxed),
+            alive: None,
+            owned: Some(owned),
+        }
+    }
+
+    /// The renderer's buffer holding this picture, if it was copied into one.
+    pub fn shared_buffer(&self) -> Option<&Arc<dyn PictureBuffer>> {
+        match &self.owned {
+            Some(Owned::Shared(buffer)) => Some(buffer),
+            _ => None,
+        }
+    }
+
     /// Bytes per sample: 1 for 8-bit, 2 for 10-bit.
     pub fn bytes_per_sample(&self) -> usize {
         if self.raw.bits > 8 { 2 } else { 1 }
@@ -740,8 +865,9 @@ impl Frame {
 /// Pictures larger than this are copied by several threads: one core copies
 /// 8K (44 MB) in ~2.5 ms on the Frame, with spikes to 9 ms.
 const PARALLEL_COPY_BYTES: usize = 16 << 20;
-/// Threads copying a large picture, the caller's included.
-const COPY_THREADS: usize = 4;
+/// Threads copying a large picture, the caller's included. Two copy 8K as
+/// fast as four (the memory system is the limit, 3.0 against 3.1 ms) at half the CPU time.
+const COPY_THREADS: usize = 2;
 
 impl Frame {
     /// Bytes `copy_to` writes: every plane's rows, packed.
@@ -757,6 +883,18 @@ impl Frame {
         let rows: Vec<&[u8]> = (0..self.plane_count()).flat_map(|p| self.rows(p)).collect();
         copy_rows(&rows, dst)
     }
+}
+
+/// Threads copying a large picture (`JUST_VIDEO_COPY_THREADS` to compare).
+fn copy_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("JUST_VIDEO_COPY_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(COPY_THREADS)
+    })
 }
 
 /// Copies `rows` packed into `dst`, large copies split over `COPY_THREADS`.
@@ -775,7 +913,7 @@ fn copy_rows(rows: &[&[u8]], dst: &mut [u8]) -> usize {
         return total;
     }
     std::thread::scope(|scope| {
-        let per = rows.len().div_ceil(COPY_THREADS);
+        let per = rows.len().div_ceil(copy_threads());
         let mut rest = &mut dst[..total];
         let mut parts = rows.chunks(per).peekable();
         while let Some(part) = parts.next() {
@@ -794,8 +932,14 @@ fn copy_rows(rows: &[&[u8]], dst: &mut [u8]) -> usize {
 
 impl Drop for Frame {
     fn drop(&mut self) {
-        unsafe { jv_frame_release(self.raw.handle) };
-        self.alive.fetch_sub(1, Ordering::SeqCst);
+        match self.owned.take() {
+            Some(Owned::Heap(buffer, pool)) => pool.give(buffer),
+            Some(Owned::Shared(_)) => {}
+            None => unsafe { jv_frame_release(self.raw.handle) },
+        }
+        if let Some(alive) = &self.alive {
+            alive.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -944,7 +1088,8 @@ impl VideoDecoder {
                 Ok(Some(Frame {
                     raw: unsafe { raw.assume_init() },
                     serial: FRAME_SERIAL.fetch_add(1, Ordering::Relaxed),
-                    alive: self.alive.clone(),
+                    alive: Some(self.alive.clone()),
+                    owned: None,
                 }))
             }
             AVERROR_EOF => Ok(None),
@@ -1572,6 +1717,84 @@ mod seek_tests {
         assert!(!reopen_to_seek(info("hevc").as_ref()));
         assert!(!reopen_to_seek(info("vp9").as_ref()));
         assert!(!reopen_to_seek(None));
+    }
+}
+
+#[cfg(test)]
+mod detach_tests {
+    use super::*;
+
+    /// A 6x4 NV12 picture in its own buffer with padded rows (stride 8),
+    /// standing in for a decoder's frame.
+    fn nv12(pool: &FramePool) -> Frame {
+        let mut buffer = vec![0u8; 8 * 4 + 8 * 2];
+        for (i, b) in buffer.iter_mut().enumerate() {
+            *b = (i * 5 % 251) as u8;
+        }
+        let raw = RawFrame {
+            handle: std::ptr::null_mut(),
+            layout: 1,
+            width: 6,
+            height: 4,
+            bits: 8,
+            plane_count: 2,
+            data: [buffer.as_ptr(), buffer[32..].as_ptr(), std::ptr::null()],
+            linesize: [8, 8, 0],
+            pts: 1.5,
+            matrix: 0,
+            full_range: 0,
+            transfer: 0,
+            hardware: 1,
+        };
+        Frame {
+            raw,
+            serial: 0,
+            alive: None,
+            owned: Some(Owned::Heap(buffer, pool.clone())),
+        }
+    }
+
+    fn rows_of(frame: &Frame) -> Vec<Vec<u8>> {
+        (0..frame.plane_count())
+            .flat_map(|p| frame.rows(p).map(<[u8]>::to_vec).collect::<Vec<_>>())
+            .collect()
+    }
+
+    #[test]
+    fn a_detached_frame_has_the_same_rows_and_no_padding() {
+        let pool = FramePool::default();
+        let source = nv12(&FramePool::default());
+        let copy = source.detach(&pool);
+        assert_eq!(rows_of(&source), rows_of(&copy));
+        assert_eq!(copy.packed_len(), 6 * 4 + 6 * 2);
+        assert_eq!(copy.raw.linesize[..2], [6, 6]);
+        assert_eq!((copy.width(), copy.height(), copy.pts()), (6, 4, Some(1.5)));
+        // A detached frame is a valid source too.
+        assert_eq!(rows_of(&copy.detach(&pool)), rows_of(&source));
+    }
+
+    #[test]
+    fn a_detached_frames_memory_goes_back_to_the_pool() {
+        let pool = FramePool::default();
+        let source = nv12(&FramePool::default());
+        let first = source.detach(&pool);
+        let address = first.raw.data[0];
+        drop(first);
+        let second = source.detach(&pool);
+        assert_eq!(second.raw.data[0], address, "the buffer was reused");
+    }
+
+    #[test]
+    fn a_detached_frame_leaves_the_decoders_count_alone() {
+        let alive = Arc::new(AtomicUsize::new(1));
+        let mut source = nv12(&FramePool::default());
+        source.alive = Some(alive.clone());
+        let copy = source.detach(&FramePool::default());
+        assert_eq!(alive.load(Ordering::SeqCst), 1);
+        drop(copy);
+        assert_eq!(alive.load(Ordering::SeqCst), 1);
+        drop(source);
+        assert_eq!(alive.load(Ordering::SeqCst), 0);
     }
 }
 
