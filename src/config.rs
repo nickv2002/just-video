@@ -403,6 +403,33 @@ struct Settings {
     autoplay_next: bool,
 }
 
+/// Writes `settings.json`, keeping keys this build doesn't know (top level and
+/// inside `player`) that another version saved, so rolling back to an older
+/// build and forward again doesn't lose settings the older one lacks.
+fn write_settings(settings: &Settings) -> anyhow::Result<()> {
+    let mut new = serde_json::to_value(settings)?;
+    if let Ok(serde_json::Value::Object(old)) = read_json::<serde_json::Value>("settings.json")
+        && let Some(map) = new.as_object_mut()
+    {
+        for (key, value) in old {
+            match (map.get_mut(&key), value) {
+                (None, value) => {
+                    map.insert(key, value);
+                }
+                (Some(serde_json::Value::Object(mine)), serde_json::Value::Object(theirs))
+                    if key == "player" =>
+                {
+                    for (k, v) in theirs {
+                        mine.entry(k).or_insert(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    write_file("settings.json", &serde_json::to_vec_pretty(&new)?, false)
+}
+
 /// Choices made on the Settings screen.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -487,7 +514,7 @@ pub fn update_preferences(change: impl FnOnce(&mut Preferences)) -> anyhow::Resu
     let mut prefs = settings.player.unwrap_or_default();
     change(&mut prefs);
     settings.player = Some(prefs);
-    write_json("settings.json", &settings, false)?;
+    write_settings(&settings)?;
     Ok(prefs)
 }
 
@@ -500,7 +527,7 @@ pub fn autoplay_next() -> bool {
 pub fn save_autoplay_next(on: bool) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.autoplay_next = on;
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 pub fn sort_mode() -> SortMode {
@@ -513,7 +540,7 @@ pub fn sort_mode() -> SortMode {
 pub fn save_sort_mode(mode: SortMode) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.sort = Some(mode);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// Subtitle size and position, the same for every video.
@@ -544,7 +571,7 @@ pub fn caption_settings() -> CaptionSettings {
 pub fn save_caption_settings(captions: CaptionSettings) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.captions = Some(captions);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// Formats the format button cycles through. Default: flat 2D and VR180 3D.
@@ -570,7 +597,7 @@ pub fn favourite_formats() -> Vec<Format> {
 pub fn save_favourite_formats(formats: &[Format]) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.favourite_formats = Some(formats.to_vec());
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 #[cfg(test)]
@@ -629,6 +656,27 @@ mod tests {
         let p = preferences();
         assert_eq!((p.long_jump, p.volume_step), (600, 20));
         assert_eq!(caption_settings().scale, 1.5);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_keeps_settings_from_other_versions() {
+        let dir = temp_config("unknown-keys");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"future":{"a":1},"player":{"short_jump":7,"future_pref":true}}"#,
+        )
+        .unwrap();
+        update_preferences(|p| p.long_jump = 90).unwrap();
+        save_autoplay_next(true).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(v["future"]["a"], 1);
+        assert_eq!(v["player"]["future_pref"], true);
+        assert_eq!(v["player"]["short_jump"], 7);
+        assert_eq!(v["player"]["long_jump"], 90);
+        assert_eq!(v["autoplay_next"], true);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
