@@ -712,12 +712,35 @@ mod tests {
 
     #[test]
     fn a_stall_with_the_frame_loop_stopped_is_not_a_dead_decoder() {
-        assert_eq!(judge_stall(true, 3), Stall::WaitForConsumer);
+        assert_eq!(judge_stall(true, false, 3), Stall::WaitForConsumer);
         // Nothing held: nothing explains the silence.
-        assert_eq!(judge_stall(true, 0), Stall::Replace);
+        assert_eq!(judge_stall(true, false, 0), Stall::Replace);
         // The loop runs and drops frames within a frame: the decoder is dead.
-        assert_eq!(judge_stall(false, 3), Stall::Replace);
-        assert_eq!(judge_stall(false, 0), Stall::Replace);
+        assert_eq!(judge_stall(false, false, 3), Stall::Replace);
+        assert_eq!(judge_stall(false, false, 0), Stall::Replace);
+    }
+
+    #[test]
+    fn a_stall_while_paused_is_not_a_dead_decoder() {
+        // Paused, the frame loop runs but takes no pictures: the held ones fill the decoder.
+        assert_eq!(judge_stall(false, true, 5), Stall::WaitForConsumer);
+        assert_eq!(judge_stall(false, true, 0), Stall::Replace);
+    }
+
+    #[test]
+    fn waiting_while_paused_ends_on_resume_jump_or_stop() {
+        use std::sync::atomic::AtomicU64;
+        let paused = AtomicBool::new(true);
+        let (requested, stop) = (AtomicU64::new(7), AtomicBool::new(false));
+        // A jump asked for ends it at once.
+        wait_while_paused(&paused, &AtomicU64::new(8), 7, &stop);
+        // So does playing again.
+        paused.store(false, Ordering::Relaxed);
+        wait_while_paused(&paused, &requested, 7, &stop);
+        // And stop.
+        paused.store(true, Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
+        wait_while_paused(&paused, &requested, 7, &stop);
     }
 
     #[test]
@@ -1244,11 +1267,27 @@ enum Stall {
     Replace,
 }
 
-fn judge_stall(consumer_silent: bool, frames_alive: usize) -> Stall {
-    if consumer_silent && frames_alive > 0 {
+fn judge_stall(consumer_silent: bool, paused: bool, frames_alive: usize) -> Stall {
+    if (consumer_silent || paused) && frames_alive > 0 {
         Stall::WaitForConsumer
     } else {
         Stall::Replace
+    }
+}
+
+/// Blocks while paused until playing again, a jump is asked for (`requested`
+/// moves off `generation`) or `stop`.
+fn wait_while_paused(
+    paused: &AtomicBool,
+    requested: &AtomicU64,
+    generation: u64,
+    stop: &AtomicBool,
+) {
+    while paused.load(Ordering::Relaxed)
+        && requested.load(Ordering::Relaxed) == generation
+        && !stop.load(Ordering::Relaxed)
+    {
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -1483,6 +1522,9 @@ struct DecodeThread {
     /// Set while the decode thread waits for every frame to be dropped, to
     /// replace the decoder (see `replace_decoder`).
     release_frames: Arc<AtomicBool>,
+    /// Set while the user has paused: the held pictures then fill the decoder
+    /// and it returns nothing, which is not a failure.
+    paused: Arc<AtomicBool>,
     /// Ticks whenever the frame loop looks at the playback (see `Pulse`).
     pulse: Pulse,
     pipeline: Arc<PipelineStats>,
@@ -1563,6 +1605,8 @@ fn spawn_decoder(
     let on_hardware = back_on_hardware.clone();
     let release_frames = Arc::new(AtomicBool::new(false));
     let release = release_frames.clone();
+    let paused = Arc::new(AtomicBool::new(false));
+    let user_paused = paused.clone();
     let pulse = Pulse::new();
     let consumer = pulse.clone();
     let pipeline = Arc::new(PipelineStats::default());
@@ -1824,11 +1868,18 @@ fn spawn_decoder(
                             && e.is::<crate::media::DecoderStalled>()
                             && judge_stall(
                                 consumer.silent_for() >= CONSUMER_SILENT,
+                                decoded.is_some() && user_paused.load(Ordering::Relaxed),
                                 decoder.frames_alive(),
                             ) == Stall::WaitForConsumer =>
                     {
-                        eprintln!("Decoder: no picture while the frame loop is stopped; waiting for it");
-                        wait_for_consumer(&consumer, &stop);
+                        if consumer.silent_for() >= CONSUMER_SILENT {
+                            eprintln!("Decoder: no picture while the frame loop is stopped; waiting for it");
+                            wait_for_consumer(&consumer, &stop);
+                        } else {
+                            // Paused: the held pictures fill the decoder; it goes on at resume.
+                            eprintln!("Decoder: no picture while paused; waiting for resume");
+                            wait_while_paused(&user_paused, &pending, generation, &stop);
+                        }
                         continue 'decode;
                     }
                     // At a jump, the hardware decoder's driver sometimes refuses to
@@ -2055,6 +2106,7 @@ fn spawn_decoder(
         moved_to_cpu,
         back_on_hardware,
         release_frames,
+        paused,
         pulse,
         pipeline: shared_pipeline,
     }
@@ -2591,6 +2643,9 @@ impl Playback {
             }
             None => self.paused_at = Some(now),
         }
+        self.decode
+            .paused
+            .store(self.paused(), Ordering::Relaxed);
         if let Some(audio) = &self.audio {
             audio.paused.store(self.paused(), Ordering::Relaxed);
         }
