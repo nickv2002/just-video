@@ -88,10 +88,13 @@ pub enum Request {
         share: String,
     },
     /// Checks the login (and that shares can be listed), then saves the server.
+    /// With `save_offline` (an edit) it is saved even when that fails, so a
+    /// server that is switched off can still be changed.
     AddServer {
         id: u64,
         server: Server,
         password: String,
+        save_offline: bool,
     },
 }
 
@@ -376,6 +379,8 @@ pub enum Response {
     ServerAdded {
         id: u64,
         result: Result<Server, String>,
+        /// Saved without being able to sign in: why not.
+        offline: Option<String>,
     },
 }
 
@@ -790,13 +795,23 @@ fn run(
             id,
             server,
             password,
+            save_offline,
         } => {
-            let result = connect(&server, Some(password.clone())).and_then(|s| {
-                s.shares().map_err(err)?;
+            let checked = connect(&server, Some(password.clone()))
+                .and_then(|s| s.shares().map(drop).map_err(err));
+            let (checked, offline) = match checked {
+                Err(e) if save_offline => (Ok(()), Some(e)),
+                other => (other, None),
+            };
+            let result = checked.and_then(|()| {
                 config::save_server(server.clone(), &password).map_err(err)?;
                 Ok(server)
             });
-            Response::ServerAdded { id, result }
+            Response::ServerAdded {
+                id,
+                result,
+                offline,
+            }
         }
     }
 }
@@ -1590,6 +1605,58 @@ impl LayoutOverride {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_edit_of_an_offline_server_is_saved_with_a_note() {
+        let dir = crate::config::temp_config("library-offline-edit");
+        // Nothing listens on port 1: the connection is refused at once.
+        let server = Server {
+            name: "off".into(),
+            url: "smb://me@127.0.0.1:1".into(),
+            writable: false,
+        };
+        let add = |save_offline| Request::AddServer {
+            id: 1,
+            server: server.clone(),
+            password: "pw".into(),
+            save_offline,
+        };
+        let go = |request| {
+            run(
+                request,
+                std::time::Instant::now(),
+                &Default::default(),
+                &Mutex::new(ProbeCache::default()),
+                &Default::default(),
+                None,
+            )
+        };
+        let Response::ServerAdded {
+            result, offline, ..
+        } = go(add(false))
+        else {
+            panic!("wrong response");
+        };
+        assert!(result.is_err() && offline.is_none());
+        assert!(
+            crate::config::servers().unwrap().is_empty(),
+            "adding still checks"
+        );
+        let Response::ServerAdded {
+            result, offline, ..
+        } = go(add(true))
+        else {
+            panic!("wrong response");
+        };
+        assert_eq!(result.unwrap(), server);
+        assert!(offline.is_some());
+        assert_eq!(crate::config::servers().unwrap(), vec![server.clone()]);
+        assert_eq!(
+            crate::config::password(&server.url).unwrap().as_deref(),
+            Some("pw")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn cached_videos_are_marked_at_once_and_the_rest_queued() {

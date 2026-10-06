@@ -9,8 +9,8 @@
 //! The server list also leads to the Settings screen ([`super::settings`]).
 
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, format_size};
-use super::form::{self, Field, Form, Key};
 use super::controls::format_time;
+use super::form::{self, Field, Form, Key};
 use super::settings::{self, Setting};
 use crate::config::{self, Place, Server, SortMode};
 use crate::library::{
@@ -31,6 +31,12 @@ pub fn is_video(name: &str) -> bool {
 }
 
 /// A row's detail line with where the viewer left off: "Resume 12:34 · title".
+/// Shown after an edit was saved although the server could not be reached.
+fn offline_notice(name: &str, why: &str) -> String {
+    let why = why.lines().next().unwrap_or(why);
+    format!("Saved {name}, but could not connect: {why}")
+}
+
 fn with_progress(detail: &str, place: Option<Place>) -> String {
     match place {
         Some(Place::Resume(seconds)) => format!("Resume {} · {detail}", format_time(seconds)),
@@ -924,7 +930,11 @@ impl Navigator {
                         self.changes_done();
                     }
                 }
-                Response::ServerAdded { id, result } if self.pending_changes.remove(&id) => {
+                Response::ServerAdded {
+                    id,
+                    result,
+                    offline,
+                } if self.pending_changes.remove(&id) => {
                     match result {
                         Ok(saved) => {
                             // An edit that changed the address replaces the old entry.
@@ -935,6 +945,9 @@ impl Navigator {
                                 eprintln!("Can't move the old server's settings: {e:#}");
                             }
                             self.show_servers();
+                            if let Some(why) = offline {
+                                self.view.notice = Some(offline_notice(&saved.name, &why));
+                            }
                         }
                         Err(e) => {
                             if let Some(f) = &mut self.view.form {
@@ -1595,6 +1608,7 @@ impl Navigator {
                     id,
                     server,
                     password,
+                    save_offline: editing.is_some(),
                 });
             }
             Some(Purpose::Rename(index)) => {
