@@ -367,6 +367,19 @@ struct ReadAheadArgs {
     /// SMB connections the file is read over (as when playing).
     #[arg(long, default_value_t = just_video::library::VIDEO_CONNECTIONS)]
     connections: usize,
+    /// Fixed read-ahead: this many reads in flight, `--blocks-ahead` the
+    /// window (the old behaviour). 0: the buffer sizes itself in seconds.
+    #[arg(long, default_value_t = 0)]
+    max_in_flight: usize,
+    /// Seconds of the stream the self-sizing buffer holds ahead.
+    #[arg(long, default_value_t = 10.0)]
+    buffer_seconds: f64,
+    /// Memory limit of the self-sizing buffer (MiB).
+    #[arg(long, default_value_t = 160)]
+    buffer_mib: usize,
+    /// Most reads in flight for the self-sizing buffer.
+    #[arg(long, default_value_t = just_video::readahead::Adaptive::default().in_flight)]
+    buffer_in_flight: usize,
 }
 
 /// `read_ahead.connections` sessions to the server in `url` (at least one).
@@ -380,6 +393,19 @@ fn connect_lanes(
 }
 
 impl ReadAheadArgs {
+    /// Applies the buffer policy: as playing does, or the fixed one.
+    fn tune(&self, reader: just_video::smb::SmbReader) -> just_video::smb::SmbReader {
+        if self.max_in_flight > 0 {
+            return reader.with_max_in_flight(self.max_in_flight);
+        }
+        reader.with_adaptive(just_video::readahead::Adaptive {
+            seconds: self.buffer_seconds,
+            max_bytes: self.buffer_mib << 20,
+            in_flight: self.buffer_in_flight,
+            ..Default::default()
+        })
+    }
+
     fn get(&self) -> ReadAhead {
         ReadAhead {
             block_size: self.block_kib.clamp(64, 8192) * 1024,
@@ -428,6 +454,34 @@ fn open_input(
             None,
         ))
     }
+}
+
+type PlaybackSource = (
+    Box<dyn Source>,
+    Vec<std::sync::Arc<SmbSession>>,
+    Option<(std::sync::Arc<just_video::read_metrics::ReadMetrics>, u64)>,
+);
+
+/// Like [`open_input`] for playing: an SMB file is read over the video's
+/// connections and registered for the timing log; also returns what sets
+/// the buffer's rate once the stream is probed (its metrics and length).
+fn open_playback(input: &str, read_ahead: &ReadAheadArgs) -> anyhow::Result<PlaybackSource> {
+    if !input.starts_with("smb://") {
+        let (source, _) = open_input(input, ReadAhead::default())?;
+        return Ok((source, Vec::new(), None));
+    }
+    let sessions = connect_lanes(input, read_ahead)?;
+    let url = sessions[0].url().clone();
+    let reader = read_ahead
+        .tune(SmbSession::open_striped(
+            &sessions,
+            &url.share,
+            &url.path,
+            read_ahead.get(),
+        )?)
+        .for_playback();
+    let stream = (reader.metrics(), reader.len());
+    Ok((Box::new(reader), sessions, Some(stream)))
 }
 
 /// Remembers every read of a run (for `bench --replay`).
@@ -1028,8 +1082,14 @@ fn main() -> anyhow::Result<()> {
             debug_view,
             read_ahead,
         } => {
-            let (source, _session) = open_input(&input, read_ahead.get())?;
+            // As the app plays: over the video's connections, the buffer sized in seconds.
+            let (source, _sessions, stream) = open_playback(&input, &read_ahead)?;
             let media = Media::open(file_name(&input), source)?;
+            if let Some((metrics, bytes)) = stream
+                && media.info().duration_seconds > 1.0
+            {
+                metrics.set_rate_hint((bytes as f64 / media.info().duration_seconds) as u64);
+            }
             let video = media.info().video.clone();
             let assessment = playability::assess(platform, video.as_ref());
             print_assessment(file_name(&input), &assessment);
@@ -1901,8 +1961,13 @@ fn main() -> anyhow::Result<()> {
             let sessions = connect_lanes(&url, &read_ahead)?;
             let session = &sessions[0];
             let path = session.url().path.clone();
-            let mut reader =
-                SmbSession::open_striped(&sessions, &session.url().share, &path, read_ahead.get())?;
+            let mut reader = read_ahead.tune(SmbSession::open_striped(
+                &sessions,
+                &session.url().share,
+                &path,
+                read_ahead.get(),
+            )?);
+            let metrics = reader.metrics();
             let limit = mib.map_or(reader.len(), |m| (m << 20).min(reader.len()));
             let mut buffer = vec![0u8; 256 * 1024];
             let mut total = 0u64;
@@ -1938,6 +2003,7 @@ fn main() -> anyhow::Result<()> {
                 "seconds": seconds,
                 "mbit_per_second": total as f64 * 8.0 / seconds / 1e6,
                 "read_stats": reader.stats(),
+                "requests": metrics.take().to_string(),
             }))?;
         }
         Command::BenchSeek {
@@ -2021,8 +2087,7 @@ fn main() -> anyhow::Result<()> {
                 Some(r) => {
                     drop(media);
                     let mut again = Media::open(file_name(&input), r.replay())?;
-                    let stats =
-                        again.decode(backend, !hw_only, &decoder_opts.join(":"), frames)?;
+                    let stats = again.decode(backend, !hw_only, &decoder_opts.join(":"), frames)?;
                     media = again;
                     Some(stats)
                 }

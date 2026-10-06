@@ -17,6 +17,7 @@ pub mod media;
 pub mod playability;
 #[cfg(feature = "decode")]
 pub mod probe_cache;
+pub mod read_metrics;
 pub mod readahead;
 pub mod smb;
 pub mod srvsvc;

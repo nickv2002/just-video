@@ -91,6 +91,7 @@ impl PipelineStats {
             bytes: self.bytes.swap(0, Relaxed),
             depth_min: (samples > 0).then_some(depth_min),
             depth_mean: (samples > 0).then(|| depth_sum as f64 / samples as f64),
+            reads: crate::read_metrics::playback_metrics().map(|m| m.take()),
         }
     }
 }
@@ -105,6 +106,8 @@ pub struct PipelineWindow {
     pub bytes: u64,
     pub depth_min: Option<usize>,
     pub depth_mean: Option<f64>,
+    /// The playing video's read-ahead buffer, if there is one.
+    pub reads: Option<crate::read_metrics::ReadWindow>,
 }
 
 impl PipelineWindow {
@@ -135,9 +138,13 @@ impl std::fmt::Display for PipelineWindow {
             self.wait_max_us as f64 / 1e3,
         )?;
         match (self.depth_min, self.depth_mean) {
-            (Some(min), Some(mean)) => write!(f, "{min} mean {mean:.1}"),
-            _ => write!(f, "-"),
+            (Some(min), Some(mean)) => write!(f, "{min} mean {mean:.1}")?,
+            _ => write!(f, "-")?,
         }
+        if let Some(reads) = &self.reads {
+            write!(f, ", {reads}")?;
+        }
+        Ok(())
     }
 }
 
