@@ -700,6 +700,9 @@ pub fn run(
     // for frames then, so draw them anyway (it just doesn't show them).
     let render_unseen = std::env::var_os("JUST_VIDEO_RENDER_UNSEEN").is_some();
     let mut timing = FrameTiming::default();
+    if let Mode::Playing(playback) = &mode {
+        timing.watch(Some(playback.pipeline()));
+    }
     // Time since `mark` in ms; moves `mark` to now.
     let lap = |mark: &mut Instant| {
         let now = Instant::now();
