@@ -746,6 +746,10 @@ pub fn run(
             }
         }
         if !running {
+            // No session, nothing drawn: the decoder still needs its frames let go.
+            if let Mode::Playing(playback) = &mut mode {
+                playback.keep_flowing(None);
+            }
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
@@ -757,6 +761,11 @@ pub fn run(
         timing.add(Phase::Wait, lap(&mut mark));
         stats.xr_frames += 1;
         if !state.should_render && !render_unseen {
+            // Headset off: nothing is drawn, but the pictures keep being taken, or
+            // the decoder starves, is replaced for it and the replacement refused.
+            if let Mode::Playing(playback) = &mut mode {
+                playback.keep_flowing(Some(state.predicted_display_time.as_nanos()));
+            }
             ctx.frame_stream
                 .end(state.predicted_display_time, ctx.blend_mode, &[])?;
             timing.restart();

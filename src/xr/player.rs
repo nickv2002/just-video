@@ -439,6 +439,296 @@ mod tests {
         let f = apply(p.rotation(), [0.0, 0.0, -1.0]);
         assert!(f[1] > 0.2, "pitch up raises the screen: {f:?}");
     }
+
+    /// A decoder whose session the driver keeps open while frames from it
+    /// live, and refuses to start another next to it, as iris does at 8K.
+    struct MockSession {
+        alive: Arc<std::sync::atomic::AtomicUsize>,
+        events: Arc<Mutex<Vec<String>>>,
+        /// Hardware opens that fail (the driver refuses) before one works.
+        refusals: u32,
+    }
+
+    impl MockSession {
+        fn new(frames_held: usize, refusals: u32) -> Self {
+            Self {
+                alive: Arc::new(std::sync::atomic::AtomicUsize::new(frames_held)),
+                events: Arc::default(),
+                refusals,
+            }
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl Session for MockSession {
+        fn frames_alive(&self) -> usize {
+            self.alive.load(Ordering::SeqCst)
+        }
+
+        fn reopen(&mut self, try_hardware: bool, free_behind: bool) -> anyhow::Result<bool> {
+            let alive = self.frames_alive();
+            let mut events = self.events.lock().unwrap();
+            events.push(format!(
+                "open hw={try_hardware} free_behind={free_behind} old_frames={alive}"
+            ));
+            // Hardware that is refused falls back to the CPU in the same call.
+            let refused = alive > 0 || self.refusals > 0;
+            if try_hardware && refused {
+                self.refusals = self.refusals.saturating_sub(1);
+                events.push("refused (-12)".into());
+                return Ok(false);
+            }
+            Ok(try_hardware)
+        }
+    }
+
+    /// A frame loop: beats while `running`, drops every frame when asked to
+    /// (unless it `leaks`).
+    fn spawn_consumer(
+        pulse: &Pulse,
+        release: &Arc<AtomicBool>,
+        alive: &Arc<std::sync::atomic::AtomicUsize>,
+        events: &Arc<Mutex<Vec<String>>>,
+        start_after: Duration,
+        leaks: bool,
+        done: &Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        let (pulse, release, alive, events, done) = (
+            pulse.clone(),
+            release.clone(),
+            alive.clone(),
+            events.clone(),
+            done.clone(),
+        );
+        std::thread::spawn(move || {
+            std::thread::sleep(start_after);
+            while !done.load(Ordering::Relaxed) {
+                pulse.beat();
+                if !leaks && release.load(Ordering::Relaxed) && alive.swap(0, Ordering::SeqCst) > 0
+                {
+                    events.lock().unwrap().push("frames dropped".into());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    }
+
+    fn gate<'a>(
+        release: &'a AtomicBool,
+        stop: &'a AtomicBool,
+        pulse: &'a Pulse,
+        quick_ms: u64,
+    ) -> ReleaseGate<'a> {
+        ReleaseGate {
+            release,
+            stop,
+            pulse,
+            quick: Duration::from_millis(quick_ms),
+            patient: Duration::from_secs(10),
+        }
+    }
+
+    #[test]
+    fn the_old_session_closes_before_the_new_one_opens() {
+        let (release, stop, done) = (
+            Arc::new(AtomicBool::new(false)),
+            AtomicBool::new(false),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let pulse = Pulse::new();
+        let mut decoder = MockSession::new(3, 0);
+        let consumer = spawn_consumer(
+            &pulse,
+            &release,
+            &decoder.alive,
+            &decoder.events,
+            Duration::ZERO,
+            false,
+            &done,
+        );
+        let hardware = replace_decoder(
+            &mut decoder,
+            &gate(&release, &stop, &pulse, 300),
+            true,
+            true,
+        )
+        .unwrap();
+        done.store(true, Ordering::Relaxed);
+        consumer.join().unwrap();
+        assert!(hardware, "a healthy driver gives the hardware decoder back");
+        assert_eq!(
+            decoder.events(),
+            [
+                "frames dropped",
+                "open hw=true free_behind=true old_frames=0"
+            ],
+            "frames let go first, then the new session"
+        );
+        assert!(!release.load(Ordering::Relaxed), "the request is withdrawn");
+    }
+
+    #[test]
+    fn a_stopped_frame_loop_is_waited_for_not_raced() {
+        let (release, stop, done) = (
+            Arc::new(AtomicBool::new(false)),
+            AtomicBool::new(false),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let pulse = Pulse::new();
+        std::thread::sleep(CONSUMER_SILENT + Duration::from_millis(50));
+        assert!(pulse.silent_for() >= CONSUMER_SILENT);
+        let mut decoder = MockSession::new(3, 0);
+        // The headset goes back on after 600 ms.
+        let consumer = spawn_consumer(
+            &pulse,
+            &release,
+            &decoder.alive,
+            &decoder.events,
+            Duration::from_millis(600),
+            false,
+            &done,
+        );
+        let began = Instant::now();
+        let hardware =
+            replace_decoder(&mut decoder, &gate(&release, &stop, &pulse, 50), true, true).unwrap();
+        let took = began.elapsed();
+        done.store(true, Ordering::Relaxed);
+        consumer.join().unwrap();
+        assert!(hardware, "no refusal, no CPU fallback");
+        assert!(took >= Duration::from_millis(550), "waited: {took:?}");
+        assert_eq!(
+            decoder.events(),
+            [
+                "frames dropped",
+                "open hw=true free_behind=true old_frames=0"
+            ]
+        );
+    }
+
+    #[test]
+    fn frames_a_running_loop_never_lets_go_do_not_stop_the_replacement() {
+        let (release, stop, done) = (
+            Arc::new(AtomicBool::new(false)),
+            AtomicBool::new(false),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let pulse = Pulse::new();
+        let mut decoder = MockSession::new(3, 0);
+        let consumer = spawn_consumer(
+            &pulse,
+            &release,
+            &decoder.alive,
+            &decoder.events,
+            Duration::ZERO,
+            true,
+            &done,
+        );
+        let began = Instant::now();
+        replace_decoder(&mut decoder, &gate(&release, &stop, &pulse, 60), true, true).unwrap();
+        let took = began.elapsed();
+        done.store(true, Ordering::Relaxed);
+        consumer.join().unwrap();
+        assert!(took < Duration::from_secs(2), "gave up waiting: {took:?}");
+        let events = decoder.events();
+        // Opening beside the old session can't work, and freeing behind
+        // can't help: not asked for.
+        assert_eq!(events[0], "open hw=true free_behind=false old_frames=3");
+    }
+
+    #[test]
+    fn stopping_ends_the_wait() {
+        let (release, stop) = (AtomicBool::new(false), AtomicBool::new(false));
+        let pulse = Pulse::new();
+        std::thread::sleep(CONSUMER_SILENT + Duration::from_millis(50));
+        let mut decoder = MockSession::new(3, 0);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                stop.store(true, Ordering::Relaxed);
+            });
+            let began = Instant::now();
+            let _ = replace_decoder(
+                &mut decoder,
+                &gate(&release, &stop, &pulse, 50),
+                true,
+                false,
+            );
+            assert!(began.elapsed() < Duration::from_secs(2));
+        });
+    }
+
+    #[test]
+    fn the_cpu_takes_over_only_after_the_hardware_failed_every_time() {
+        let (release, stop) = (AtomicBool::new(false), AtomicBool::new(false));
+        let pulse = Pulse::new();
+        // Healthy: the first replacement is hardware and nothing else follows.
+        let mut healthy = MockSession::new(0, 0);
+        let mut attempts = Vec::new();
+        let mut restarts = 0;
+        while restarts < MAX_RESTARTS {
+            restarts += 1;
+            let tries_hardware = restart_tries_hardware(restarts);
+            attempts.push(tries_hardware);
+            let hardware = replace_decoder(
+                &mut healthy,
+                &gate(&release, &stop, &pulse, 50),
+                tries_hardware,
+                false,
+            )
+            .unwrap();
+            if hardware {
+                break;
+            }
+        }
+        assert_eq!(attempts, [true], "no CPU unless the hardware failed");
+
+        // The driver refuses twice: two hardware tries, then the CPU.
+        let mut refused = MockSession::new(0, 2);
+        let mut attempts = Vec::new();
+        let mut restarts = 0;
+        let mut on_cpu = false;
+        while restarts < MAX_RESTARTS {
+            restarts += 1;
+            let tries_hardware = restart_tries_hardware(restarts);
+            attempts.push(tries_hardware);
+            let hardware = replace_decoder(
+                &mut refused,
+                &gate(&release, &stop, &pulse, 50),
+                tries_hardware,
+                false,
+            )
+            .unwrap();
+            if hardware {
+                break;
+            }
+            on_cpu = !tries_hardware;
+        }
+        assert_eq!(attempts, [true, true, false]);
+        assert!(on_cpu);
+    }
+
+    #[test]
+    fn a_stall_with_the_frame_loop_stopped_is_not_a_dead_decoder() {
+        assert_eq!(judge_stall(true, 3), Stall::WaitForConsumer);
+        // Nothing held: nothing explains the silence.
+        assert_eq!(judge_stall(true, 0), Stall::Replace);
+        // The loop runs and drops frames within a frame: the decoder is dead.
+        assert_eq!(judge_stall(false, 3), Stall::Replace);
+        assert_eq!(judge_stall(false, 0), Stall::Replace);
+    }
+
+    #[test]
+    fn the_pulse_goes_silent_and_comes_back() {
+        let pulse = Pulse::new();
+        assert!(pulse.silent_for() < Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(pulse.silent_for() >= Duration::from_millis(50));
+        pulse.beat();
+        assert!(pulse.silent_for() < Duration::from_millis(50));
+    }
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -858,8 +1148,116 @@ struct StaleFrames {
     key: Option<f64>,
 }
 
-/// Waits this long at most for the player to drop the old decoder's frames.
-const RELEASE_WAIT: Duration = Duration::from_millis(300);
+/// Shows that the frame loop is looking at the playback: it beats each time it
+/// runs `advance` (or, with the headset off, its stand-in), so the decode
+/// thread can tell a consumer that stopped from a decoder that stopped.
+#[derive(Clone)]
+struct Pulse(Arc<AtomicU64>);
+
+impl Pulse {
+    fn epoch() -> Instant {
+        static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *EPOCH.get_or_init(Instant::now)
+    }
+
+    fn new() -> Self {
+        let pulse = Self(Arc::new(AtomicU64::new(0)));
+        pulse.beat();
+        pulse
+    }
+
+    fn beat(&self) {
+        self.0.store(
+            Self::epoch().elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn silent_for(&self) -> Duration {
+        let now = Self::epoch().elapsed().as_micros() as u64;
+        Duration::from_micros(now.saturating_sub(self.0.load(Ordering::Relaxed)))
+    }
+}
+
+/// A frame loop that hasn't looked at the playback for this long isn't running
+/// (the headset is off and nothing is drawn, or the loop is stuck).
+const CONSUMER_SILENT: Duration = Duration::from_millis(250);
+
+/// What recovery needs of a decoder (a mock stands in for it in tests).
+trait Session {
+    /// Frames from this decoder still alive anywhere.
+    fn frames_alive(&self) -> usize;
+    /// Replaces the video decoder: Ok(true) if the new one is the hardware
+    /// decoder, Ok(false) if it's the CPU's.
+    fn reopen(&mut self, try_hardware: bool, free_behind: bool) -> anyhow::Result<bool>;
+}
+
+impl Session for VideoDecoder {
+    fn frames_alive(&self) -> usize {
+        VideoDecoder::frames_alive(self)
+    }
+
+    fn reopen(&mut self, try_hardware: bool, free_behind: bool) -> anyhow::Result<bool> {
+        self.reopen_video(try_hardware, free_behind)?;
+        Ok(self.stats().hw_backend.is_some())
+    }
+}
+
+/// How the decode thread waits for the player to drop the old decoder's frames.
+struct ReleaseGate<'a> {
+    /// Set while asking the player to drop them.
+    release: &'a AtomicBool,
+    stop: &'a AtomicBool,
+    /// The frame loop's beat: when it runs, it drops them within a frame.
+    pulse: &'a Pulse,
+    /// A running frame loop that still holds frames after this is leaking
+    /// them (no waiting helps).
+    quick: Duration,
+    /// A frame loop that isn't running is waited for this long at most.
+    patient: Duration,
+}
+
+impl<'a> ReleaseGate<'a> {
+    const QUICK: Duration = Duration::from_millis(300);
+    const PATIENT: Duration = Duration::from_secs(30);
+
+    fn new(release: &'a AtomicBool, stop: &'a AtomicBool, pulse: &'a Pulse) -> Self {
+        Self {
+            release,
+            stop,
+            pulse,
+            quick: Self::QUICK,
+            patient: Self::PATIENT,
+        }
+    }
+}
+
+/// Whether a hardware decoder that returned no picture is dead, or only has
+/// nowhere to put one: every buffer it has is in frames held by a frame loop
+/// that stopped (the headset was taken off). Replacing it then fails (the old
+/// session lives as long as those frames) and can't help.
+#[derive(Debug, PartialEq)]
+enum Stall {
+    /// Wait for the frame loop, then try the same decoder again.
+    WaitForConsumer,
+    /// Replace the decoder.
+    Replace,
+}
+
+fn judge_stall(consumer_silent: bool, frames_alive: usize) -> Stall {
+    if consumer_silent && frames_alive > 0 {
+        Stall::WaitForConsumer
+    } else {
+        Stall::Replace
+    }
+}
+
+/// Blocks until the frame loop beats again (or `stop`).
+fn wait_for_consumer(pulse: &Pulse, stop: &AtomicBool) {
+    while pulse.silent_for() >= CONSUMER_SILENT && !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 /// Replaces the hardware decoder with a new one (or the CPU's), closing the
 /// old session first: its frames are dropped (the player lets go of its
@@ -871,32 +1269,55 @@ const RELEASE_WAIT: Duration = Duration::from_millis(300);
 /// were queued (the last 30), and at least 30. So with Steam's web helper
 /// holding a session, a flushed 6K60 or 8K60 decoder (measured at 60) is
 /// refused, and a new one (30) passes; with two, 8K doesn't open at all.
-fn replace_decoder(
-    decoder: &mut VideoDecoder,
-    release: &AtomicBool,
-    stop: &AtomicBool,
+///
+/// The old session lives as long as one of its frames does, so a new decoder
+/// opened while the player still holds any is refused too (-12, ~350 ms
+/// lost, and the CPU after three tries). The player drops them within a
+/// frame when its loop runs; when it doesn't (headset off), this waits for it,
+/// up to `gate.patient`. A running loop that still holds frames after
+/// `gate.quick` leaks them: the new decoder opens anyway.
+///
+/// Returns whether the new decoder is the hardware one.
+fn replace_decoder<S: Session>(
+    decoder: &mut S,
+    gate: &ReleaseGate,
     try_hardware: bool,
     free_behind: bool,
-) -> anyhow::Result<()> {
-    release.store(true, Ordering::Relaxed);
+) -> anyhow::Result<bool> {
+    gate.release.store(true, Ordering::Relaxed);
     let asked = Instant::now();
-    while decoder.frames_alive() > 0
-        && asked.elapsed() < RELEASE_WAIT
-        && !stop.load(Ordering::Relaxed)
-    {
+    while decoder.frames_alive() > 0 && !gate.stop.load(Ordering::Relaxed) {
+        let waited = asked.elapsed();
+        let running = gate.pulse.silent_for() < CONSUMER_SILENT;
+        if (running && waited >= gate.quick) || waited >= gate.patient {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(2));
     }
-    release.store(false, Ordering::Relaxed);
+    gate.release.store(false, Ordering::Relaxed);
     let alive = decoder.frames_alive();
     if alive > 0 {
         eprintln!("Decoder: {alive} frames still held; replacing it anyway");
     }
-    decoder.reopen_video(try_hardware, free_behind)
+    // With frames alive the old session stays open however it's freed.
+    decoder.reopen(try_hardware, free_behind && alive == 0)
 }
+
+/// How long the hardware decoder may return no picture while playing
+/// (the frame loop drawing, a picture decoded since the last jump), and at
+/// any other time.
+const STALL_PLAYING: Duration = Duration::from_millis(1500);
+const STALL_DEFAULT: Duration = Duration::from_secs(3);
 
 /// Restarts of the hardware decoder after it fails at a jump; the last one
 /// moves decoding to the CPU.
 const MAX_RESTARTS: u32 = 3;
+
+/// Whether the restart after `restarts` failures (counting the one starting)
+/// still tries the hardware decoder.
+fn restart_tries_hardware(restarts: u32) -> bool {
+    restarts < MAX_RESTARTS
+}
 
 /// Shown when the hardware video decoder can't be used.
 pub const ON_CPU_NOTICE: &str = "Hardware video decoder unavailable: playing on the CPU. \
@@ -1062,6 +1483,8 @@ struct DecodeThread {
     /// Set while the decode thread waits for every frame to be dropped, to
     /// replace the decoder (see `replace_decoder`).
     release_frames: Arc<AtomicBool>,
+    /// Ticks whenever the frame loop looks at the playback (see `Pulse`).
+    pulse: Pulse,
     pipeline: Arc<PipelineStats>,
 }
 
@@ -1140,6 +1563,8 @@ fn spawn_decoder(
     let on_hardware = back_on_hardware.clone();
     let release_frames = Arc::new(AtomicBool::new(false));
     let release = release_frames.clone();
+    let pulse = Pulse::new();
+    let consumer = pulse.clone();
     let pipeline = Arc::new(PipelineStats::default());
     let shared_pipeline = pipeline;
     let pipeline = shared_pipeline.clone();
@@ -1184,6 +1609,7 @@ fn spawn_decoder(
             let mut to_keyframe = false;
             let mut behind = Behind::new();
             let mut hardware_retry = HardwareRetry::new();
+            let gate = ReleaseGate::new(&release, &stop, &consumer);
             // End of the sound sent for this generation: a decoder replaced
             // in place (`restarts`, `HardwareRetry`) decodes some of it again.
             let mut sound_until = f64::NEG_INFINITY;
@@ -1274,7 +1700,7 @@ fn spawn_decoder(
                         let free_behind = replace && decoder.can_free_behind();
                         if replace
                             && let Err(e) =
-                                replace_decoder(&mut decoder, &release, &stop, true, free_behind)
+                                replace_decoder(&mut decoder, &gate, true, free_behind)
                         {
                             // No decoder left: the next frame fails.
                             eprintln!("Replacing the decoder at a jump failed: {e:#}");
@@ -1360,6 +1786,20 @@ fn spawn_decoder(
                 }
                 let began = Instant::now();
                 let io_before = decoder.io();
+                // Mid-playback, with the frame loop drawing, a decoder that
+                // stops is dead: replace it sooner than after a jump (the first
+                // picture may take a while). Reads don't count, the stalled
+                // network is not the decoder.
+                decoder.set_stall_limit(
+                    if decoded.is_some()
+                        && shown.lock().expect("shown clock").is_some()
+                        && consumer.silent_for() < CONSUMER_SILENT
+                    {
+                        STALL_PLAYING
+                    } else {
+                        STALL_DEFAULT
+                    },
+                );
                 let result = decoder.next_frame();
                 let took = began.elapsed();
                 let io = decoder.io();
@@ -1376,6 +1816,21 @@ fn spawn_decoder(
                         Decoded::Frame(generation, frame)
                     }
                     Ok(None) => Decoded::End(generation),
+                    // No picture because the frame loop stopped taking them (the
+                    // headset is off): every buffer is in a held frame, and a
+                    // new decoder couldn't open while they live. Wait for it.
+                    Err(e)
+                        if hardware
+                            && e.is::<crate::media::DecoderStalled>()
+                            && judge_stall(
+                                consumer.silent_for() >= CONSUMER_SILENT,
+                                decoder.frames_alive(),
+                            ) == Stall::WaitForConsumer =>
+                    {
+                        eprintln!("Decoder: no picture while the frame loop is stopped; waiting for it");
+                        wait_for_consumer(&consumer, &stop);
+                        continue 'decode;
+                    }
                     // At a jump, the hardware decoder's driver sometimes refuses to
                     // restart (iris: "current session not supported", then busy or
                     // out of memory for good): replace the decoder and jump again,
@@ -1387,9 +1842,8 @@ fn spawn_decoder(
                         let free_behind = restarts == 1 && decoder.can_free_behind();
                         let reopened = replace_decoder(
                             &mut decoder,
-                            &release,
-                            &stop,
-                            restarts < MAX_RESTARTS,
+                            &gate,
+                            restart_tries_hardware(restarts),
                             free_behind,
                         );
                         hardware = decoder.stats().hw_backend.is_some();
@@ -1402,8 +1856,8 @@ fn spawn_decoder(
                             began.elapsed().as_secs_f64() * 1e3,
                             if free_behind { "old one freed meanwhile, " } else { "" },
                             match &reopened {
-                                Ok(()) if hardware => "hardware".to_string(),
-                                Ok(()) => "software".to_string(),
+                                Ok(true) => "hardware".to_string(),
+                                Ok(false) => "software".to_string(),
                                 Err(e) => format!("{e:#}"),
                             }
                         );
@@ -1601,6 +2055,7 @@ fn spawn_decoder(
         moved_to_cpu,
         back_on_hardware,
         release_frames,
+        pulse,
         pipeline: shared_pipeline,
     }
 }
@@ -2081,6 +2536,25 @@ impl Playback {
         while self.decode.frames.try_recv().is_ok() {}
     }
 
+    /// For a frame loop that isn't drawing (the headset is off, or the session
+    /// not running): lets go of the frames the decode thread asks for, and
+    /// shows that the loop is alive, so a decoder isn't replaced for want of
+    /// them. With `now`, also takes the pictures that fall due, as drawing
+    /// would, so the decoder keeps going.
+    pub fn keep_flowing(&mut self, now: Option<i64>) {
+        match now {
+            Some(now) => {
+                self.advance(now);
+            }
+            None => {
+                self.decode.pulse.beat();
+                if self.decode.release_frames.load(Ordering::Relaxed) {
+                    self.release_frames();
+                }
+            }
+        }
+    }
+
     pub fn paused(&self) -> bool {
         self.paused_at.is_some()
     }
@@ -2158,6 +2632,7 @@ impl Playback {
 
     /// Moves to the newest decoded frame due at `now`; true if it changed.
     pub fn advance(&mut self, now: i64) -> bool {
+        self.decode.pulse.beat();
         // Also while paused: the decoder is being replaced.
         if self.decode.release_frames.load(Ordering::Relaxed) {
             self.release_frames();

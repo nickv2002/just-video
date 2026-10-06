@@ -98,6 +98,7 @@ int jv_decoder_reopen_video(JVDecoder *decoder, int try_hardware, int free_behin
 int jv_decoder_return_to_hardware(JVDecoder *decoder);
 // While catching up after a seek, skip non-reference frames of packets before
 // `seconds` (they would be discarded anyway); <= 0 turns it off.
+void jv_decoder_set_stall_limit(JVDecoder *decoder, int64_t microseconds);
 void jv_decoder_skip_nonref_until(JVDecoder *decoder, double seconds);
 // Decodes only keyframes until one at or after `seconds` (falling far behind).
 // Makes the next jv_decoder_next return the first keyframe's picture without

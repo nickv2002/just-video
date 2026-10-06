@@ -544,6 +544,7 @@ unsafe extern "C" {
     ) -> c_int;
     fn jv_decoder_return_to_hardware(decoder: *mut RawDecoder) -> c_int;
     fn jv_decoder_first_picture(decoder: *mut RawDecoder);
+    fn jv_decoder_set_stall_limit(decoder: *mut RawDecoder, microseconds: i64);
     fn jv_decoder_skip_nonref_until(decoder: *mut RawDecoder, seconds: f64);
     fn jv_decoder_skip_to_keyframe_after(decoder: *mut RawDecoder, seconds: f64);
     fn jv_decoder_keyframe(decoder: *mut RawDecoder, seconds: f64, after: c_int) -> f64;
@@ -574,7 +575,22 @@ unsafe extern "C" {
 }
 
 const AVERROR_EOF: c_int = -0x20464F45; // FFERRTAG('E','O','F',' ')
+const AVERROR_ETIMEDOUT: c_int = -110;
 const AVERROR_PATCHWELCOME: c_int = -0x45574150; // FFERRTAG('P','A','W','E')
+
+/// The hardware decoder returned no picture within the stall limit: it
+/// stopped, or has no buffer to decode into because the frames it gave out
+/// are held elsewhere (see `xr::player::replace_decoder`).
+#[derive(Debug)]
+pub struct DecoderStalled;
+
+impl std::fmt::Display for DecoderStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Decoding failed (FFmpeg error {AVERROR_ETIMEDOUT})")
+    }
+}
+
+impl std::error::Error for DecoderStalled {}
 
 /// How the planes of a decoded frame are arranged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -906,6 +922,14 @@ impl VideoDecoder {
         unsafe { jv_decoder_skip_to_keyframe_after(self.raw, seconds) }
     }
 
+    /// How long [`Self::next_frame`] waits for the hardware decoder's picture
+    /// before it fails with [`DecoderStalled`] (the default is 3 s). Time
+    /// spent reading the file doesn't count.
+    pub fn set_stall_limit(&mut self, limit: std::time::Duration) {
+        let us = i64::try_from(limit.as_micros()).unwrap_or(i64::MAX);
+        unsafe { jv_decoder_set_stall_limit(self.raw, us) }
+    }
+
     /// Decoder name, backend and fallback note (counters are not updated).
     pub fn stats(&self) -> &DecodeStats {
         &self.stats
@@ -925,6 +949,7 @@ impl VideoDecoder {
             }
             AVERROR_EOF => Ok(None),
             AVERROR_PATCHWELCOME => bail!("Decoder produced an unsupported pixel format"),
+            AVERROR_ETIMEDOUT => Err(DecoderStalled.into()),
             code => bail!("Decoding failed (FFmpeg error {code})"),
         }
     }

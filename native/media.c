@@ -247,6 +247,7 @@ struct JVDecoder {
     // Skip every frame but keyframes instead, until a keyframe at or after
     // `skip_until` (frames after a skipped one can't be decoded until then).
     int skip_to_key;
+    int64_t stall_us;  // 0: HARDWARE_STALL_US
     // Video packets read ahead of the video decoder (AVPacket *), so the sound,
     // decoded as it is read, stays ahead even when decoding the picture is
     // slower than real time (8K on the CPU). `held`: one the decoder refused for now.
@@ -934,7 +935,7 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
         int ret = avcodec_receive_frame(d->ctx, frame);
         if (ret == AVERROR(EAGAIN) && (d->ctx->codec->capabilities & AV_CODEC_CAP_HARDWARE)) {
             waited += av_gettime_relative() - began;
-            if (waited > HARDWARE_STALL_US) {
+            if (waited > (d->stall_us ? d->stall_us : HARDWARE_STALL_US)) {
                 av_log(NULL, AV_LOG_ERROR, "Hardware decoder returned no picture for %lld ms\n",
                        (long long)(waited / 1000));
                 av_frame_free(&frame);
@@ -1076,4 +1077,10 @@ void jv_media_close(JVMedia *media) {
         avio_context_free(&media->io);
     }
     av_free(media);
+}
+
+// How long jv_decoder_next may wait for a hardware picture before it fails
+// with ETIMEDOUT; 0 restores the default.
+void jv_decoder_set_stall_limit(JVDecoder *d, int64_t microseconds) {
+    d->stall_us = microseconds > 0 ? microseconds : 0;
 }
