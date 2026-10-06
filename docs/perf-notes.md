@@ -505,3 +505,31 @@ same `copy ahead` (1.7 ms); with the staging pool 14.4-15.5 -> 9.5-9.6 s. `JUST_
 - Not tried: importing the driver's DMABUFs into Vulkan (no CPU copy at all; needs the buffers' format
   modifier and `VK_EXT_image_drm_format_modifier` on Turnip), a separate demux thread (reads do not block
   the decoder in steady state since the read buffer was resized), frame blending for 60 fps on 72 Hz.
+
+## Staging pool at 8K in the real app (2026-10-06)
+
+`scripts/frame-soak.sh`, 8K HEVC side-by-side file on the hardware decoder, muted, nothing worn (`play` with
+`JUST_VIDEO_RENDER_UNSEEN`), start 600 s, jumps `40:jump+100 80:jump-50 115:jump+150`, 3 alternating pairs of 180 s,
+default (pool) against `JUST_VIDEO_NO_DETACH=1`. Steam's web helper held a second decoder session at first (8K
+fell to the CPU, `-12`); after it was restarted (`pkill -x steamwebhelper`) every run opened on the hardware.
+
+| 8K, 180 s, 3 jumps | pool (3 runs) | NO_DETACH (3 runs) |
+|---|---|---|
+| uploaded / skipped | 10659/0, 10644/0, 10650/0 | 10649/5, 10652/0, 10660/1 |
+| display periods missed | 0, 0, 0 | 1, 0, 1 |
+| queue depth mean (steady windows) | 8.0 | 1.0 |
+| `copy ahead` in the frame loop | 0.0 ms | 3.5-3.7 ms mean (max 9-17) |
+| `nothing decoded` at start | 0 | 1 in each run |
+| jump ready, median per run | 282, 280, 268 ms | 290, 291, 290 ms |
+| decoder replacements | 3 (one per jump, `-12`, 56-65 ms) | 3 (63-71 ms) |
+| RSS end / threads / fds | 1171-1172 MiB / 17-20 / 101-141 | 1172 MiB / 17-20 / 101-141 |
+| CPU fallback | 0 | 0 |
+
+`VmRSS` is the same with and without the pool (the staging memory is GPU-mapped shared memory). System memory
+used while playing: 8270 MB with the pool against 7663 MB without (idle 5103), `Shmem` +440 MB: the pool costs
+about 600 MB, as estimated (530 MB).
+
+10-minute 8K run, defaults, 9 jumps (+-60 to 200 s): 35680 uploaded, 6 skipped, 0 display periods missed, 9
+replacements (58-81 ms, all hardware, no CPU), jumps ready median 286 ms (worst 534), longest read wait 273 ms,
+RSS 685 -> 1180 MiB (max 1201, +1.1 MiB/min after minute 1, i.e. buffer growth to its 88 MiB aim), threads
+17-20, fds 101-141, steady, no errors. Conclusion: the pool works at 8K and is not worse; keep it on by default.
