@@ -1583,6 +1583,30 @@ fn main() -> anyhow::Result<()> {
             };
             just_video::ui::save_png(
                 &render(&folder, &mut fonts, Some((700.0, 400.0)), true),
+                &dir.join("folder-select.png"),
+            )?;
+            // A deep path with long names: the oldest crumbs give way to a
+            // "…", and the tools have their own row below.
+            let mut long = folder.clone();
+            long.heading = None;
+            long.crumbs = crumbs(&[
+                "Just Video",
+                "smb://someone@a-very-long-server-name.example",
+                "Shared Media Archive",
+                "Holiday Recordings From Several Years",
+                "Summer Trip To The Mountains",
+                "Raw Footage Straight From The Camera",
+            ]);
+            long.tools = vec![
+                Tool::icon(just_video::ui::browser::ToolIcon::Thumbnails, false),
+                Tool::text("Sort: Unseen", false),
+                Tool::text("Autoplay", false),
+            ];
+            for row in &mut long.rows {
+                row.checked = None;
+            }
+            just_video::ui::save_png(
+                &render(&long, &mut fonts, Some((700.0, 400.0)), true),
                 &dir.join("folder.png"),
             )?;
             // Flat, 3D and VR videos at each verdict, marked as the browser marks them.

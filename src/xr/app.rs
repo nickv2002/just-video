@@ -129,9 +129,10 @@ impl Panel {
 }
 
 /// The browser starts 2.2 m ahead: far enough that pointing needs only
-/// small hand movements, and scaled to look as big as 1.6 × 1.0 m at 1.5 m.
+/// small hand movements, and scaled to look as big as 1.6 × 1.07 m at 1.5 m.
 const BROWSER_DISTANCE: f32 = 2.2;
-const BROWSER_SIZE: [f32; 2] = [2.347, 1.467];
+// 1600 x 1070 canvas px at 681 px per metre.
+const BROWSER_SIZE: [f32; 2] = [2.347, 1.57];
 
 /// Where the browser starts: a little below eye level.
 fn browser_placement(pivot: [f32; 3]) -> Placement {

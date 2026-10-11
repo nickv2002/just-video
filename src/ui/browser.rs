@@ -9,8 +9,14 @@ use crate::vr::{Layout, Projection, Stereo};
 use std::sync::Arc;
 
 pub const WIDTH: u32 = 1600;
-pub const HEIGHT: u32 = 1000;
-const HEADER: f32 = 120.0;
+/// Two header rows (path, then tools) on top of the 1600x1000 list area.
+pub const HEIGHT: u32 = 1070;
+const HEADER: f32 = 190.0;
+/// Top of the tool buttons: the header's second row. The first holds the path.
+const TOOL_Y: f32 = 106.0;
+/// Top and height of a breadcrumb's hit and hover box, in the first row.
+const CRUMB_Y: f32 = 36.0;
+const CRUMB_H: f32 = 62.0;
 const BOTTOM: f32 = 24.0;
 /// Row heights: plain, and with a thumbnail slot.
 const ROW: f32 = 88.0;
@@ -32,6 +38,10 @@ const TOOL_W: f32 = 220.0;
 const TOOL_GAP: f32 = 12.0;
 /// A square icon button in the header.
 const ICON_TOOL_W: f32 = 84.0;
+/// Shown in place of the crumbs the path has no room for.
+const ELLIPSIS: &str = "…";
+/// Gap between the path and the build label.
+const BUILD_GAP: f32 = 40.0;
 
 /// Shown top right so installs can be told apart.
 pub const BUILD: &str = env!("JUST_VIDEO_BUILD");
@@ -298,15 +308,11 @@ fn dialog_buttons(n: usize) -> Vec<Rect> {
         .collect()
 }
 
-fn tools_width(view: &View) -> f32 {
-    view.tools.iter().map(|t| t.width() + TOOL_GAP).sum()
-}
-
 fn tool_rect(view: &View, k: usize) -> Rect {
     let right: f32 = view.tools[k..].iter().map(|t| t.width() + TOOL_GAP).sum();
     (
         WIDTH as f32 - PAD - right + TOOL_GAP,
-        36.0,
+        TOOL_Y,
         view.tools[k].width(),
         62.0,
     )
@@ -333,26 +339,78 @@ pub fn rows_for_drag(view: &View, dy: f32) -> f32 {
     dy / view.row_h()
 }
 
-/// Horizontal extent of each breadcrumb, as drawn.
-pub fn crumb_spans(view: &View, fonts: &mut Fonts) -> Vec<(f32, f32)> {
-    let max_w = crumb_limit(view, fonts);
-    let mut x = PAD;
-    let mut spans = Vec::new();
-    for (i, crumb) in view.crumbs.iter().enumerate() {
-        let w = fonts.measure(crumb, CRUMB_SIZE).min(max_w);
-        spans.push((x, x + w));
-        x += w;
-        if i + 1 < view.crumbs.len() {
-            x += fonts.measure(CRUMB_SEP, CRUMB_SIZE);
-        }
-    }
-    spans
+/// One breadcrumb as drawn: the crumb it stands for and its horizontal extent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CrumbSpan {
+    /// Index into [`View::crumbs`]; for the "…" that stands in for dropped
+    /// crumbs, the nearest dropped one (the parent of the first shown after it).
+    pub index: usize,
+    pub elided: bool,
+    pub x0: f32,
+    pub x1: f32,
 }
 
-fn crumb_limit(view: &View, fonts: &mut Fonts) -> f32 {
-    // Room left of the tools and build label, shared by at most a few long names.
-    let right = (fonts.measure(BUILD, 20.0) + 40.0).max(tools_width(view) + 24.0);
-    ((WIDTH as f32 - 2.0 * PAD - right) / 3.0).max(160.0)
+/// Width the path may use: the first row, left of the build label.
+fn path_room(fonts: &mut Fonts) -> f32 {
+    WIDTH as f32 - 2.0 * PAD - fonts.measure(BUILD, 20.0) - BUILD_GAP
+}
+
+/// The breadcrumbs as drawn, left to right. The path gets the whole first row
+/// (less the build label); when it does not fit, the oldest crumbs after the
+/// first are replaced by one "…" and the last is shortened if it still must.
+pub fn crumb_spans(view: &View, fonts: &mut Fonts) -> Vec<CrumbSpan> {
+    let n = view.crumbs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let room = path_room(fonts);
+    let sep = fonts.measure(CRUMB_SEP, CRUMB_SIZE);
+    let widths: Vec<f32> = view
+        .crumbs
+        .iter()
+        .map(|c| fonts.measure(c, CRUMB_SIZE))
+        .collect();
+    let total: f32 = widths.iter().sum::<f32>() + sep * (n - 1) as f32;
+    // Which crumbs show: all, or the first, an ellipsis, and the newest that fit.
+    let (first_shown, elide) = if total <= room || n <= 2 {
+        (1, false)
+    } else {
+        let dots = fonts.measure(ELLIPSIS, CRUMB_SIZE);
+        let mut used = widths[0] + sep + dots + sep + widths[n - 1];
+        let mut from = n - 1;
+        while from > 1 && used + sep + widths[from - 1] <= room {
+            used += sep + widths[from - 1];
+            from -= 1;
+        }
+        (from, true)
+    };
+    let mut items: Vec<(usize, bool, f32)> = vec![(0, false, widths[0])];
+    if elide {
+        let dots = fonts.measure(ELLIPSIS, CRUMB_SIZE);
+        items.push((first_shown - 1, true, dots));
+    }
+    items.extend((first_shown..n).map(|i| (i, false, widths[i])));
+    // Whatever is still too wide (a very long last name) is clipped.
+    let fixed: f32 = items.iter().map(|i| i.2).sum::<f32>() + sep * (items.len() - 1) as f32;
+    let last = items.len() - 1;
+    if fixed > room && items.len() > 1 {
+        let others = fixed - items[last].2;
+        items[last].2 = (room - others).max(120.0);
+    }
+    let mut x = PAD;
+    items
+        .into_iter()
+        .map(|(index, elided, w)| {
+            let span = CrumbSpan {
+                index,
+                elided,
+                x0: x,
+                x1: x + w,
+            };
+            x += w + sep;
+            span
+        })
+        .collect()
 }
 
 fn row_rect(view: &View, i: usize) -> Rect {
@@ -397,16 +455,24 @@ pub fn fixed_targets(view: &View, fonts: &mut Fonts) -> Vec<(Hit, Rect)> {
             .map(|(i, r)| (Hit::DialogButton(i), r))
             .collect();
     }
-    // The last crumb is where we are: not a link.
-    let spans = crumb_spans(view, fonts);
-    let links = spans.len().saturating_sub(1);
-    let crumbs = spans
-        .into_iter()
-        .take(links)
-        .enumerate()
-        .map(|(i, (a, b))| (Hit::Crumb(i), (a - 8.0, 36.0, b - a + 16.0, 62.0)));
+    // The last crumb is where we are: not a link. A heading replaces the path.
+    let last = view.crumbs.len().saturating_sub(1);
+    let crumbs: Vec<_> = if view.heading.is_some() {
+        Vec::new()
+    } else {
+        crumb_spans(view, fonts)
+            .into_iter()
+            .filter(|c| c.index < last)
+            .map(|c| {
+                (
+                    Hit::Crumb(c.index),
+                    (c.x0 - 8.0, CRUMB_Y, c.x1 - c.x0 + 16.0, CRUMB_H),
+                )
+            })
+            .collect()
+    };
     let tools = (0..view.tools.len()).map(|k| (Hit::Tool(k), tool_rect(view, k)));
-    crumbs.chain(tools).collect()
+    crumbs.into_iter().chain(tools).collect()
 }
 
 /// Row `i`'s targets, left to right: the row itself, then its actions.
@@ -442,13 +508,16 @@ pub fn hit(view: &View, fonts: &mut Fonts, x: f32, y: f32) -> Hit {
         if view.heading.is_some() {
             return Hit::Nothing;
         }
-        // The last crumb is where we are: not a link.
+        // The last crumb is where we are: not a link. They sit in the first
+        // row; the tools (above) in the second.
         let last = view.crumbs.len().saturating_sub(1);
         return crumbs
             .iter()
-            .position(|&(a, b)| x >= a - 8.0 && x <= b + 8.0 && y > 30.0)
-            .filter(|&i| i < last)
-            .map_or(Hit::Nothing, Hit::Crumb);
+            .find(|c| {
+                x >= c.x0 - 8.0 && x <= c.x1 + 8.0 && y > CRUMB_Y - 6.0 && y < CRUMB_Y + CRUMB_H
+            })
+            .filter(|c| c.index < last)
+            .map_or(Hit::Nothing, |c| Hit::Crumb(c.index));
     }
     if view.status.is_some() || y > HEIGHT as f32 - BOTTOM || x < PAD || x > WIDTH as f32 - PAD {
         return Hit::Nothing;
@@ -924,34 +993,46 @@ pub fn render_into(
                 }
             }
         }
-        let limit = crumb_limit(view, fonts);
         let last = view.crumbs.len().saturating_sub(1);
         if let Some(heading) = &view.heading {
             // The selection's tools need the header: the crumbs make way.
-            let room = WIDTH as f32 - 2.0 * PAD - tools_width(view) - 24.0;
+            let room = path_room(fonts);
             fonts.draw(&mut canvas, heading, PAD, 78.0, CRUMB_SIZE, TEXT, room);
-        }
-        for (i, crumb) in view
-            .crumbs
-            .iter()
-            .enumerate()
-            .filter(|_| view.heading.is_none())
-        {
-            let (x0, x1) = crumbs[i];
-            let hovered = hover == Some(Hit::Crumb(i));
-            if hovered {
-                canvas.rect(x0 - 10.0, 34.0, x1 - x0 + 20.0, 60.0, 10.0, HOVER);
-            }
-            let color = if i == last || hovered { TEXT } else { SUBTLE };
-            fonts.draw(&mut canvas, crumb, x0, 78.0, CRUMB_SIZE, color, limit);
-            if i < last {
-                fonts.draw(&mut canvas, CRUMB_SEP, x1, 78.0, CRUMB_SIZE, FAINT, 200.0);
+        } else {
+            for span in &crumbs {
+                let (x0, x1) = (span.x0, span.x1);
+                let hovered = hover == Some(Hit::Crumb(span.index)) && span.index < last;
+                if hovered {
+                    canvas.rect(x0 - 10.0, CRUMB_Y - 2.0, x1 - x0 + 20.0, 60.0, 10.0, HOVER);
+                }
+                let color = if span.index == last || hovered {
+                    TEXT
+                } else {
+                    SUBTLE
+                };
+                let text = if span.elided {
+                    ELLIPSIS
+                } else {
+                    &view.crumbs[span.index]
+                };
+                fonts.draw(
+                    &mut canvas,
+                    text,
+                    x0,
+                    78.0,
+                    CRUMB_SIZE,
+                    color,
+                    x1 - x0 + 1.0,
+                );
+                if span.index < last {
+                    fonts.draw(&mut canvas, CRUMB_SEP, x1, 78.0, CRUMB_SIZE, FAINT, 200.0);
+                }
             }
         }
     }
-    // Above the tools, so both fit.
+    // At the right of the path's row, level with it; the tools have their own.
     let build_w = fonts.measure(BUILD, 20.0);
-    let build_y = if view.tools.is_empty() { 44.0 } else { 26.0 };
+    let build_y = 78.0;
     fonts.draw(
         &mut canvas,
         BUILD,
@@ -1129,7 +1210,7 @@ mod tests {
         let mut view = view();
         let mut fonts = Fonts::load().expect("fonts");
         let spans = crumb_spans(&view, &mut fonts);
-        let last = (spans[2].0 + spans[2].1) / 2.0;
+        let last = (spans[2].x0 + spans[2].x1) / 2.0;
         assert_eq!(hit(&view, &mut fonts, 400.0, HEADER + 10.0), Hit::Row(0));
         view.scroll = 5.0;
         assert_eq!(
@@ -1336,6 +1417,117 @@ mod tests {
         let plain = render(&view, &mut fonts, None, false);
         let (_, py, _, ph) = row_rect(&view, 0);
         assert_eq!(pixel(&plain, PAD + 48.0, py + ph / 2.0), GREEN);
+    }
+
+    fn long_path_view() -> View {
+        View {
+            crumbs: [
+                "Just Video",
+                "smb://someone@a-very-long-server-name.example",
+                "Shared Media Archive",
+                "Holiday Recordings From Several Years",
+                "Summer Trip To The Mountains Part Two",
+                "Raw Footage Straight From The Camera Card",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            tools: vec![
+                Tool::icon(ToolIcon::Thumbnails, true),
+                Tool::text("Sort: Unseen", false),
+                Tool::text("Autoplay", false),
+            ],
+            rows: (0..5)
+                .map(|i| Row::new(Icon::Folder, format!("{i}")))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_long_path_elides_old_crumbs_and_never_reaches_the_build_label() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let view = long_path_view();
+        let spans = crumb_spans(&view, &mut fonts);
+        let n = view.crumbs.len();
+        assert_eq!(spans.first().map(|s| (s.index, s.elided)), Some((0, false)));
+        assert_eq!(
+            spans.last().map(|s| (s.index, s.elided)),
+            Some((n - 1, false))
+        );
+        let dots: Vec<_> = spans.iter().filter(|s| s.elided).collect();
+        assert_eq!(dots.len(), 1, "one ellipsis: {spans:?}");
+        // It stands for the crumbs dropped before the first one shown after it.
+        let after = spans.iter().position(|s| s.elided).unwrap() + 1;
+        assert_eq!(dots[0].index, spans[after].index - 1);
+        assert!(dots[0].index >= 1);
+        let limit = WIDTH as f32 - PAD - fonts.measure(BUILD, 20.0) - BUILD_GAP + 0.5;
+        for w in spans.windows(2) {
+            assert!(w[0].x1 < w[1].x0, "overlap: {spans:?}");
+        }
+        assert!(spans.last().unwrap().x1 <= limit, "{spans:?} past {limit}");
+        // Clear of every tool, and on a different row from them.
+        for k in 0..view.tools.len() {
+            let (tx, ty, tw, th) = tool_rect(&view, k);
+            assert!(ty > CRUMB_Y + CRUMB_H, "tools sit below the path");
+            assert!(tx + tw <= WIDTH as f32 - PAD + 0.5 && th > 0.0);
+        }
+        // What is drawn is what is hit: shown links navigate, the last does not.
+        for s in &spans {
+            let (x, y) = ((s.x0 + s.x1) / 2.0, CRUMB_Y + 20.0);
+            let want = if s.index == n - 1 {
+                Hit::Nothing
+            } else {
+                Hit::Crumb(s.index)
+            };
+            assert_eq!(hit(&view, &mut fonts, x, y), want, "{s:?}");
+        }
+        // The tools are reachable and the list starts below them.
+        for k in 0..view.tools.len() {
+            let (tx, ty, tw, th) = tool_rect(&view, k);
+            assert_eq!(
+                hit(&view, &mut fonts, tx + tw / 2.0, ty + th / 2.0),
+                Hit::Tool(k)
+            );
+            assert!(ty + th < HEADER - 8.0);
+        }
+        // The D-pad's targets are the same ones, none under the build label.
+        let targets = fixed_targets(&view, &mut fonts);
+        assert_eq!(targets.len(), spans.len() - 1 + view.tools.len());
+        for (h, (x, y, w, _)) in &targets {
+            if matches!(h, Hit::Crumb(_)) {
+                assert!(*y < TOOL_Y && x + w <= limit + 8.0 + 0.5);
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_path_is_left_alone() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let view = view();
+        let spans = crumb_spans(&view, &mut fonts);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|s| (s.index, s.elided))
+                .collect::<Vec<_>>(),
+            [(0, false), (1, false), (2, false)]
+        );
+    }
+
+    #[test]
+    fn one_enormous_crumb_is_clipped_to_the_row() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let view = View {
+            crumbs: vec!["Just Video".into(), "x".repeat(300)],
+            ..Default::default()
+        };
+        let spans = crumb_spans(&view, &mut fonts);
+        assert_eq!(spans.len(), 2);
+        let limit = WIDTH as f32 - PAD - fonts.measure(BUILD, 20.0) - BUILD_GAP + 0.5;
+        assert!(spans[1].x1 <= limit);
+        // Drawing it must not panic or leave the canvas.
+        render(&view, &mut fonts, None, false);
     }
 
     #[test]
