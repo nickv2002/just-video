@@ -25,6 +25,8 @@ pub struct XrContext {
     pub frame_stream: xr::FrameStream<xr::Vulkan>,
     /// The display rates the runtime offers (empty without the extension).
     pub refresh_rates: Vec<f32>,
+    /// XR_KHR_composition_layer_cylinder: overlays can bend with a curved screen.
+    pub cylinder_layers: bool,
 }
 
 impl XrContext {
@@ -52,6 +54,16 @@ impl XrContext {
         extensions.khr_vulkan_enable2 = true;
         // Lets a video ask for a display rate its frame rate divides (see `refresh`).
         extensions.fb_display_refresh_rate = available.fb_display_refresh_rate;
+        let cylinder_layers = available.khr_composition_layer_cylinder;
+        extensions.khr_composition_layer_cylinder = cylinder_layers;
+        eprintln!(
+            "OpenXR: cylinder layers {}",
+            if cylinder_layers {
+                "available"
+            } else {
+                "not offered (subtitles stay flat on a curved screen)"
+            }
+        );
         // Native Steam Frame controller bindings (otherwise SteamVR remaps Index ones).
         const FRAME_CONTROLLER: &str = "XR_VALVE_frame_controller_interaction";
         // The crate keeps these names NUL-terminated (they go to the runtime as C strings).
@@ -185,6 +197,7 @@ impl XrContext {
             session,
             frame_waiter,
             frame_stream,
+            cylinder_layers,
         })
     }
 

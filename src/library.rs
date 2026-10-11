@@ -16,12 +16,59 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
 };
 
 pub type Path = Vec<String>;
+
+/// Watches a listing in progress: entries received so far, and a flag that
+/// stops it early (the browser left the folder).
+#[derive(Clone, Debug, Default)]
+pub struct Listing {
+    pub count: Arc<AtomicUsize>,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// Stable source paths retained while browsing for a move destination.
+#[derive(Clone, Debug)]
+pub struct MoveSelection {
+    pub server: Server,
+    pub share: String,
+    pub paths: Vec<Path>,
+}
+
+impl MoveSelection {
+    pub fn targets(
+        &self,
+        server: &Server,
+        share: &str,
+        destination: &Path,
+    ) -> Result<Vec<Path>, String> {
+        if server.url != self.server.url || !share.eq_ignore_ascii_case(&self.share) {
+            return Err("Choose a folder in the same share".into());
+        }
+        if self.paths.is_empty() {
+            return Err("No items selected".into());
+        }
+        self.paths
+            .iter()
+            .map(|path| {
+                crate::smb::move_target(&smb_path(path), &smb_path(destination))
+                    .map(|target| target.split('\\').map(str::to_string).collect())
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+    }
+}
+
+#[derive(Default)]
+pub struct MoveResult {
+    /// Only failed sources remain available for another destination or retry.
+    pub failed: Vec<Path>,
+    pub errors: Vec<String>,
+}
 
 pub enum Request {
     Shares {
@@ -33,6 +80,7 @@ pub enum Request {
         server: Server,
         share: String,
         path: Path,
+        watch: Listing,
     },
     /// Marks a folder's videos: from the probe cache at once, the others by
     /// reading their headers, a few at a time, top row first.
@@ -87,6 +135,11 @@ pub enum Request {
         server: Server,
         share: String,
     },
+    Move {
+        id: u64,
+        selection: MoveSelection,
+        destination: Path,
+    },
     /// Checks the login (and that shares can be listed), then saves the server.
     /// With `save_offline` (an edit) it is saved even when that fails, so a
     /// server that is switched off can still be changed.
@@ -133,6 +186,8 @@ pub struct Opened {
     pub image: config::ImageAdjust,
     /// Where this file was left last time (seconds), to continue from.
     pub resume: Option<f64>,
+    /// The network reader's buffer, for the seek bar.
+    pub buffer: crate::readahead::BufferWatch,
 }
 
 pub struct ExternalSubtitles {
@@ -283,6 +338,7 @@ pub fn open_video(
     // The buffer ahead is sized in seconds of this video (see `Adaptive`);
     // the stream's rate is known once the file has been probed.
     let mut stream = None;
+    let mut buffer = None;
     let media = SmbSession::open_striped(sessions, share, &smb_path(path), ReadAhead::default())
         .map_err(err)
         .and_then(|reader| {
@@ -292,6 +348,7 @@ pub fn open_video(
                 .with_hedge(crate::readahead::hedge_floor())
                 .for_playback();
             stream = Some((reader.metrics(), reader.len()));
+            buffer = Some(reader.watch());
             Media::open(&name, reader).map_err(err)
         });
     timing.lap("probe");
@@ -344,6 +401,7 @@ pub fn open_video(
         external_subtitles,
         image,
         resume,
+        buffer: buffer.unwrap_or_default(),
     }))
 }
 
@@ -375,7 +433,14 @@ pub enum Response {
         image: Arc<crate::media::Thumb>,
     },
     /// Rename or delete finished.
-    Changed { id: u64, result: Result<(), String> },
+    Changed {
+        id: u64,
+        result: Result<(), String>,
+    },
+    Moved {
+        id: u64,
+        result: MoveResult,
+    },
     ServerAdded {
         id: u64,
         result: Result<Server, String>,
@@ -620,6 +685,7 @@ fn handle(
         Request::Open { server, .. } => (server.clone(), "open"),
         Request::Rename { server, .. } => (server.clone(), "rename"),
         Request::Delete { server, .. } => (server.clone(), "delete"),
+        Request::Move { selection, .. } => (selection.server.clone(), "move"),
         Request::AddServer { server, .. } => (server.clone(), "add server"),
         Request::Warm { server, .. } => (server.clone(), "warm"),
         Request::ThumbnailFolder { .. } | Request::ThumbnailFocus { .. } => {
@@ -633,6 +699,11 @@ fn handle(
         | Response::Opened { result: Err(e), .. }
         | Response::Changed { result: Err(e), .. }
         | Response::ServerAdded { result: Err(e), .. } => Some(e.clone()),
+        Response::Moved { result, .. } => result
+            .errors
+            .iter()
+            .find(|e| e.contains("stopped sending") || e.contains("did not answer"))
+            .cloned(),
         _ => None,
     };
     if let Some(e) = failure {
@@ -695,10 +766,16 @@ fn run(
             server,
             share,
             path,
+            watch,
         } => Response::List {
             id,
-            result: session(sessions, &server, Purpose::Browse)
-                .and_then(|s| s.list_in(&share, &smb_path(&path)).map_err(err)),
+            result: session(sessions, &server, Purpose::Browse).and_then(|s| {
+                s.list_in_watched(&share, &smb_path(&path), &mut |n| {
+                    watch.count.store(n, Ordering::Relaxed);
+                    !watch.cancel.load(Ordering::Relaxed)
+                })
+                .map_err(err)
+            }),
         },
         Request::ProbeFolder { .. }
         | Request::Warm { .. }
@@ -790,6 +867,29 @@ fn run(
                 Ok(())
             });
             Response::Changed { id, result }
+        }
+        Request::Move {
+            id,
+            selection,
+            destination,
+        } => {
+            let result = move_entries(&selection, &destination, |path, target| {
+                let s = session(sessions, &selection.server, Purpose::Browse)?;
+                s.move_in(&selection.share, &smb_path(path), &smb_path(&destination))
+                    .map_err(err)?;
+                let from = file_key(&selection.server, &selection.share, path);
+                let to = file_key(&selection.server, &selection.share, target);
+                // The remote move has already succeeded: a settings failure must
+                // never put this source back in the retry list.
+                if let Err(e) = config::move_file_state(&from, &to) {
+                    eprintln!(
+                        "Moved {} but couldn't update saved settings: {e:#}",
+                        path.join("/")
+                    );
+                }
+                Ok(())
+            });
+            Response::Moved { id, result }
         }
         Request::AddServer {
             id,
@@ -1380,7 +1480,71 @@ fn thumbnail_worker(
     }
 }
 
+/// Validates the entire batch before changing files; a failed item never makes
+/// successfully moved items eligible for retry. Stop on a wedged connection.
+fn move_entries(
+    selection: &MoveSelection,
+    destination: &Path,
+    mut move_one: impl FnMut(&Path, &Path) -> Result<(), String>,
+) -> MoveResult {
+    let targets = match selection.targets(&selection.server, &selection.share, destination) {
+        Ok(targets) => targets,
+        Err(e) => {
+            return MoveResult {
+                failed: selection.paths.clone(),
+                errors: vec![e],
+            };
+        }
+    };
+    let mut result = MoveResult::default();
+    for (i, (path, target)) in selection.paths.iter().zip(&targets).enumerate() {
+        if let Err(e) = move_one(path, target) {
+            result.failed.push(path.clone());
+            let stalled = e.contains("did not answer") || e.contains("stopped sending");
+            result
+                .errors
+                .push(format!("{}: {e}", path.last().map_or("", String::as_str)));
+            if stalled {
+                result.failed.extend_from_slice(&selection.paths[i + 1..]);
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// What a test sees of the requests a [`Library`] was given.
+#[cfg(test)]
+pub(crate) struct TestRequests(mpsc::Receiver<(Request, std::time::Instant)>);
+
+#[cfg(test)]
+impl TestRequests {
+    pub(crate) fn try_recv(&self) -> Result<Request, mpsc::TryRecvError> {
+        self.0.try_recv().map(|(request, _)| request)
+    }
+}
+
 impl Library {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, TestRequests, mpsc::Sender<Response>) {
+        let (main, requests) = mpsc::channel();
+        let (out, responses) = mpsc::channel();
+        (
+            Self {
+                probes: main.clone(),
+                warmer: main.clone(),
+                thumbnails: mpsc::channel().0,
+                main,
+                responses,
+                probe_generation: Default::default(),
+                opening: Default::default(),
+                thumbnail_generation: Default::default(),
+            },
+            TestRequests(requests),
+            out,
+        )
+    }
+
     /// `hw` is the preferred hardware backend for playback (see `media::default_hw_backend`).
     pub fn start(hw: Option<&'static str>) -> Self {
         let sessions: Sessions = Default::default();
@@ -1889,5 +2053,82 @@ mod tests {
         ] {
             assert!(!connection_lost(kept), "{kept}");
         }
+    }
+
+    fn selection() -> MoveSelection {
+        MoveSelection {
+            server: Server {
+                name: "NAS".into(),
+                url: "smb://u@nas".into(),
+                writable: true,
+            },
+            share: "media".into(),
+            paths: vec![
+                vec!["old".into(), "a".into()],
+                vec!["old".into(), "b".into()],
+            ],
+        }
+    }
+
+    #[test]
+    fn moves_are_limited_to_the_source_share() {
+        let selection = selection();
+        let other = Server {
+            url: "smb://u@other".into(),
+            ..selection.server.clone()
+        };
+        assert!(selection.targets(&other, "media", &vec![]).is_err());
+        assert!(
+            selection
+                .targets(&selection.server, "other", &vec![])
+                .is_err()
+        );
+        assert!(
+            selection
+                .targets(&selection.server, "MEDIA", &vec![])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn invalid_destination_changes_nothing() {
+        let selection = selection();
+        let result = move_entries(
+            &selection,
+            &vec!["old".into(), "b".into(), "child".into()],
+            |_, _| panic!("must validate all sources first"),
+        );
+        assert_eq!(result.failed, selection.paths);
+        assert_eq!(result.errors.len(), 1);
+    }
+
+    #[test]
+    fn partial_moves_retain_only_failed_sources() {
+        let selection = selection();
+        let mut calls = 0;
+        let result = move_entries(&selection, &vec!["new".into()], |path, target| {
+            calls += 1;
+            assert_eq!(target[0], "new");
+            if path.last().unwrap() == "b" {
+                Err("Name exists".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(result.failed, vec![selection.paths[1].clone()]);
+        assert_eq!(result.errors, vec!["b: Name exists"]);
+    }
+
+    #[test]
+    fn stalled_move_stops_the_batch() {
+        let selection = selection();
+        let mut calls = 0;
+        let result = move_entries(&selection, &vec!["new".into()], |_, _| {
+            calls += 1;
+            Err("The server did not answer (move)".into())
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result.failed, selection.paths);
     }
 }

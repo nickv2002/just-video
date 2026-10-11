@@ -280,7 +280,7 @@ mod tests {
         for i in 0..rows {
             let mut row = Row::new(Icon::Folder, format!("Folder {i}"));
             if i == 1 {
-                row.actions = vec![Action::Rename, Action::Delete];
+                row.actions = vec![Action::Settings, Action::Remove];
             }
             v.rows.push(row);
         }
@@ -302,10 +302,10 @@ mod tests {
         let f = step(&v, &mut fonts, f, Dir::Down);
         assert_eq!(f.hit, Hit::Row(1));
         let f = step(&v, &mut fonts, f, Dir::Right);
-        assert_eq!(f.hit, Hit::RowAction(1, Action::Rename));
+        assert_eq!(f.hit, Hit::RowAction(1, Action::Settings));
         round_trips(&v, &mut fonts, &f);
         let f = step(&v, &mut fonts, f, Dir::Right);
-        assert_eq!(f.hit, Hit::RowAction(1, Action::Delete));
+        assert_eq!(f.hit, Hit::RowAction(1, Action::Remove));
         round_trips(&v, &mut fonts, &f);
         assert_eq!(step(&v, &mut fonts, f, Dir::Right), f, "edge");
         // Down to a row without buttons: the row itself.
@@ -338,7 +338,7 @@ mod tests {
         let at = at_hit(&v, &mut fonts, Hit::Row(3), p(Hit::Row(3))).unwrap();
         assert_eq!(at.hit, Hit::Row(3));
         assert_eq!(step(&v, &mut fonts, at, Dir::Down).hit, Hit::Row(4));
-        let action = Hit::RowAction(1, Action::Delete);
+        let action = Hit::RowAction(1, Action::Remove);
         let f = at_hit(&v, &mut fonts, action, p(action)).unwrap();
         assert_eq!(f.hit, action);
         round_trips(&v, &mut fonts, &f);

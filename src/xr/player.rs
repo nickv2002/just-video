@@ -43,7 +43,7 @@ impl Default for ViewOptions {
 /// Where the video is placed around the viewer (changed by dragging).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Placement {
-    /// Rotation around the viewer: yaw (left/right) and pitch (up/down), radians.
+    /// Rotation around the pivot: yaw (left/right) and pitch (up/down), radians.
     pub yaw: f32,
     pub pitch: f32,
     /// Flat/curved screen distance in metres.
@@ -51,7 +51,23 @@ pub struct Placement {
     pub curved: bool,
     /// Size multiplier: screen width for flat/curved, magnification for VR180/360.
     pub zoom: f32,
+    /// VR180/360: the viewpoint moved along the placement's -Z towards the
+    /// picture, as a fraction of the sphere's radius (0 = centre).
+    pub offset: f32,
+    /// The point the screen orbits: where the head was when it was last
+    /// placed or dragged (the reference space's origin is wherever the head
+    /// was at the start, which is no use once the viewer has lain down).
+    pub pivot: [f32; 3],
 }
+
+/// Steepest pitch: nearly overhead or underfoot, short of the pole where
+/// yaw would lose its meaning.
+pub const MAX_PITCH: f32 = 1.5;
+
+/// How far the viewpoint may move inside a spherical video: back a little
+/// (the picture shrinks), or most of the way to the picture.
+pub const MIN_OFFSET: f32 = -0.5;
+pub const MAX_OFFSET: f32 = 0.85;
 
 impl Placement {
     pub fn new(options: &ViewOptions) -> Self {
@@ -61,7 +77,36 @@ impl Placement {
             distance: options.screen_distance,
             curved: false,
             zoom: 1.0,
+            offset: 0.0,
+            pivot: [0.0; 3],
         }
+    }
+
+    /// Where the flat screen's centre is.
+    pub fn center(&self) -> [f32; 3] {
+        let r = self.rotation();
+        [0, 1, 2].map(|i| self.pivot[i] - self.distance * r[2][i])
+    }
+
+    /// Makes `head` the pivot, keeping the screen where it is (so it turns
+    /// to face the viewer from now on, and dragging orbits them, not a
+    /// point they have moved away from).
+    pub fn anchor_at(&mut self, head: [f32; 3]) {
+        let c = self.center();
+        let v = [c[0] - head[0], c[1] - head[1], c[2] - head[2]];
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if len < 0.3 {
+            // Standing in the screen: just move the pivot.
+            self.pivot = head;
+            return;
+        }
+        self.yaw = (-v[0]).atan2(-v[2]);
+        self.pitch = (v[1] / len)
+            .clamp(-1.0, 1.0)
+            .asin()
+            .clamp(-MAX_PITCH, MAX_PITCH);
+        self.distance = len.max(0.8);
+        self.pivot = head;
     }
 
     /// Rotation matrix (columns) of the placement: yaw about +Y, then pitch about +X.
@@ -423,6 +468,73 @@ mod tests {
     }
 
     #[test]
+    fn anchoring_keeps_the_screen_in_place() {
+        let mut p = Placement {
+            yaw: 0.4,
+            pitch: 0.2,
+            distance: 3.0,
+            curved: false,
+            zoom: 1.0,
+            offset: 0.0,
+            pivot: [0.0; 3],
+        };
+        let before = p.center();
+        // The viewer has lain down: 1 m lower, half a metre forward.
+        p.anchor_at([0.0, -1.0, -0.5]);
+        let after = p.center();
+        for i in 0..3 {
+            assert!(
+                (before[i] - after[i]).abs() < 1e-4,
+                "{before:?} vs {after:?}"
+            );
+        }
+        assert_eq!(p.pivot, [0.0, -1.0, -0.5]);
+        // Dragging straight up from here reaches overhead.
+        p.pitch = MAX_PITCH;
+        let c = p.center();
+        assert!(c[1] - p.pivot[1] > 2.9, "{c:?}");
+    }
+
+    #[test]
+    fn buffered_ranges_follow_the_playhead() {
+        let state = crate::readahead::Buffered {
+            position: 1_000_000,
+            len: 10_000_000,
+            ranges: vec![
+                (1_000_000, 1_500_000),
+                (1_500_000, 2_000_000),
+                (5_000_000, 5_200_000),
+            ],
+        };
+        // 100 s video: 100 000 bytes per second; playing at 12.5 s.
+        let ranges = buffered_seconds(&state, 12.5, 100.0);
+        assert_eq!(ranges, vec![(12.0, 23.0), (52.0, 55.0)]);
+        assert!(buffered_seconds(&state, 12.5, 0.0).is_empty());
+    }
+
+    #[test]
+    fn tall_screens_fit_the_same_box_as_wide_ones() {
+        let options = ViewOptions::default();
+        let size = |tex, stereo, zoom, turns| screen_size(tex, stereo, &options, zoom, turns);
+        let close =
+            |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3;
+        // Landscape video keeps the configured width.
+        assert!(close(size((1920, 1080), Stereo::Mono, 1.0, 0), [3.2, 1.8]));
+        assert!(close(size((1440, 1080), Stereo::Mono, 1.0, 0), [3.2, 2.4]));
+        assert!(close(
+            size((3840, 1080), Stereo::SideBySide, 1.0, 0),
+            [3.2, 1.8]
+        ));
+        // Turned on its side, or shot upright: as tall as a 4:3 screen, not 5.7 m.
+        let turned = size((1920, 1080), Stereo::Mono, 1.0, 1);
+        assert!(close(turned, [2.4 * 1080.0 / 1920.0, 2.4]), "{turned:?}");
+        assert!(close(size((1080, 1920), Stereo::Mono, 1.0, 0), turned));
+        // And zooming out shrinks it further.
+        let small = size((1080, 1920), Stereo::Mono, 0.25, 0);
+        assert!((small[1] - 0.6).abs() < 1e-3, "{small:?}");
+    }
+
+    #[test]
     fn placement_turns_the_screen_direction() {
         let mut p = Placement {
             yaw: std::f32::consts::FRAC_PI_2,
@@ -430,6 +542,8 @@ mod tests {
             distance: 3.0,
             curved: false,
             zoom: 1.0,
+            offset: 0.0,
+            pivot: [0.0; 3],
         };
         // Yaw 90° (left) moves the screen's forward (-Z) to -X.
         let f = apply(p.rotation(), [0.0, 0.0, -1.0]);
@@ -752,6 +866,33 @@ mod tests {
         pulse.beat();
         assert!(pulse.silent_for() < Duration::from_millis(50));
     }
+}
+
+/// See [`Playback::buffered`].
+fn buffered_seconds(
+    state: &crate::readahead::Buffered,
+    position: f64,
+    duration: f64,
+) -> Vec<(f64, f64)> {
+    if state.len == 0 || duration <= 0.0 {
+        return Vec::new();
+    }
+    let per_byte = duration / state.len as f64;
+    let at = |byte: u64| {
+        (position + (byte as f64 - state.position as f64) * per_byte).clamp(0.0, duration)
+    };
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for &(a, b) in &state.ranges {
+        let (from, to) = (at(a).floor(), at(b).ceil().min(duration));
+        if to <= from {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if last.1 >= from => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -2027,7 +2168,7 @@ fn spawn_decoder(
                         }
                     }
                 }
-                // Seeking lands on the keyframe before `start`; decode through to it.
+                // Frames before where we show from are decoded and dropped.
                 if let Decoded::Frame(_, frame) = &message
                     && let Some(pts) = frame.pts().filter(|&t| t < start)
                 {
@@ -2271,6 +2412,8 @@ pub struct Playback {
     /// Video lead over the sound (seconds) since `.0`: count, sum, min, max.
     sync_log: (Instant, u32, f64, f64, f64),
     pub stats: PlayStats,
+    /// The network reader's buffer, when playing from a share.
+    buffer: Option<crate::readahead::BufferWatch>,
 }
 
 /// Keeps the video clock on the audio clock without passing on the audio
@@ -2450,7 +2593,28 @@ impl Playback {
             shown,
             paused_at: None,
             stats: PlayStats::default(),
+            buffer: None,
         }
+    }
+
+    /// Shows the network reader's buffer on the seek bar.
+    pub fn set_buffer(&mut self, buffer: crate::readahead::BufferWatch) {
+        self.buffer = Some(buffer);
+    }
+
+    /// Stretches of the video already fetched, in seconds (sorted). Bytes
+    /// map to time at the file's average rate, anchored at the playhead
+    /// (so the fetched window always starts where playback is), in whole
+    /// seconds so the bar needn't redraw for every block.
+    pub fn buffered(&self) -> Vec<(f64, f64)> {
+        let Some(buffer) = &self.buffer else {
+            return Vec::new();
+        };
+        let state = match buffer.lock() {
+            Ok(state) => state.clone(),
+            Err(_) => return Vec::new(),
+        };
+        buffered_seconds(&state, self.position(), self.duration)
     }
 
     /// Adds subtitle files found next to the video; the first one is shown
@@ -2638,6 +2802,11 @@ impl Playback {
         }
     }
 
+    /// Waiting for the first picture after opening or seeking.
+    pub fn loading(&self) -> bool {
+        self.clock_start.is_none() && !self.ended && self.error.is_none()
+    }
+
     pub fn paused(&self) -> bool {
         self.paused_at.is_some()
     }
@@ -2682,7 +2851,9 @@ impl Playback {
         }
     }
 
-    /// Jumps to `seconds`; the current picture stays until the new one arrives.
+    /// Jumps to `seconds`; the current picture stays until the new one
+    /// arrives, which is the keyframe at or before the target (a jump
+    /// forward never lands behind where it started).
     pub fn seek(&mut self, seconds: f64) {
         // An unknown length (0) must not turn every jump into one to the start.
         let end = if self.duration > 0.0 {
@@ -2907,6 +3078,35 @@ fn mat_mul_t(a: [[f32; 3]; 3], b: [[f32; 4]; 3]) -> [[f32; 4]; 3] {
     out
 }
 
+/// Tallest flat screen at zoom 1, as a share of its width: 4:3 and wider
+/// videos are `screen_width` wide, taller ones (portrait, or turned on their
+/// side) this high, so zooming can make them small enough to see whole.
+pub const SCREEN_BOX_ASPECT: f32 = 0.75;
+
+/// Flat screen size (metres) for a video of `tex` pixels in `stereo` layout,
+/// turned `quarter_turns` clockwise.
+pub fn screen_size(
+    tex: (u32, u32),
+    stereo: Stereo,
+    options: &ViewOptions,
+    zoom: f32,
+    quarter_turns: u8,
+) -> [f32; 2] {
+    let (w, h) = (tex.0 as f32, tex.1.max(1) as f32);
+    // One eye's part of the frame.
+    let mut aspect = match stereo {
+        Stereo::SideBySide => w / 2.0 / h,
+        Stereo::TopBottom => w / (h / 2.0),
+        Stereo::Mono => w / h,
+    };
+    if quarter_turns % 2 == 1 {
+        aspect = 1.0 / aspect.max(0.01);
+    }
+    let aspect = aspect.max(0.1);
+    let width = options.screen_width * zoom * (aspect * SCREEN_BOX_ASPECT).min(1.0);
+    [width, width / aspect]
+}
+
 /// Shader parameters for one eye.
 pub fn eye_params(
     view: &xr::View,
@@ -2918,22 +3118,19 @@ pub fn eye_params(
     quarter_turns: u8,
 ) -> EyeParams {
     let (w, h) = (tex.0 as f32, tex.1 as f32);
-    // Flat screen aspect from one eye's part of the frame (turned on its side
-    // when the picture is rotated a quarter).
-    let mut aspect = match layout.stereo {
-        Stereo::SideBySide => w / 2.0 / h,
-        Stereo::TopBottom => w / (h / 2.0),
-        Stereo::Mono => w / h,
-    };
-    if quarter_turns % 2 == 1 {
-        aspect = 1.0 / aspect.max(0.01);
-    }
+    let screen = screen_size(tex, layout.stereo, options, placement.zoom, quarter_turns);
     // Express the eye in the placement's frame: the shader's screen/sphere is
     // fixed there, so rotating the placement moves the video around the viewer.
     let placed = placement.rotation();
     let p = view.pose.position;
-    let origin = mat_mul_t(placed, [[p.x, p.y, p.z, 0.0], [0.0; 4], [0.0; 4]])[0];
+    let [px, py, pz] = [
+        p.x - placement.pivot[0],
+        p.y - placement.pivot[1],
+        p.z - placement.pivot[2],
+    ];
+    let origin = mat_mul_t(placed, [[px, py, pz, 0.0], [0.0; 4], [0.0; 4]])[0];
     let curved = layout.projection == Projection::Flat && placement.curved;
+    let spherical = layout.projection != Projection::Flat;
     EyeParams {
         rot: mat_mul_t(placed, quat_to_columns(view.pose.orientation)),
         tan: [
@@ -2960,10 +3157,10 @@ pub fn eye_params(
             options.fisheye_fov.to_radians(),
         ],
         screen: [
-            options.screen_width * placement.zoom,
-            options.screen_width * placement.zoom / aspect.max(0.1),
+            screen[0],
+            screen[1],
             placement.distance,
-            0.0,
+            if spherical { placement.offset } else { 0.0 },
         ],
         tex: [w, h, options.debug_view as f32, placement.zoom],
     }

@@ -3,6 +3,10 @@
 //! or a sideways stick flick), volume (D-pad up/down). Bindings are suggested
 //! for the Steam Frame controller, Index controllers and the generic simple
 //! profile; which one the runtime picked is logged.
+//!
+//! The stick's up/down and sideways jobs are kept apart: when it leaves the
+//! centre its direction is decided once (within 30° of vertical, or not),
+//! and a sideways push gives no vertical output until it is centred again.
 
 use super::context::XrContext;
 use openxr as xr;
@@ -30,8 +34,72 @@ pub struct InputState {
     pub seek: i32,
     /// Volume step this frame: -1 down, +1 up (D-pad down/up, repeating).
     pub volume: i32,
-    /// Thumbstick vertical deflection (-1..1, up positive), strongest hand.
+    /// Thumbstick vertical deflection per hand (left, right): -1..1, up
+    /// positive, 0 in the dead zone or while the stick is pushed sideways.
+    pub stick: [f32; 2],
+    /// The stronger of the two `stick` values.
     pub scroll: f32,
+}
+
+/// Deflection below which the stick counts as centred.
+const STICK_DEADZONE: f32 = 0.2;
+/// A sideways push re-arms (and may go vertical) once back under this.
+const STICK_RECENTRE: f32 = 0.3;
+/// A sideways push this far flicks (seeks).
+const FLICK: f32 = 0.8;
+/// tan(30°): within this ratio of the axis counts as along it.
+const SECTOR: f32 = 0.577_350_3;
+
+/// What a hand's stick is doing, decided when it leaves the centre.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Stick {
+    Centred,
+    /// Pushed up or down: scroll, zoom or move.
+    Vertical,
+    /// Pushed sideways: a flick seeks once, and nothing scrolls.
+    Sideways {
+        fired: bool,
+    },
+}
+
+impl Stick {
+    /// Feeds one reading; returns the vertical output and whether a flick
+    /// fired (-1, 0 or +1).
+    fn update(&mut self, x: f32, y: f32) -> (f32, i32) {
+        let mag = x.hypot(y);
+        let vertical = x.abs() <= SECTOR * y.abs();
+        let sideways = y.abs() <= SECTOR * x.abs();
+        match *self {
+            Stick::Centred if mag >= STICK_DEADZONE => {
+                *self = if vertical {
+                    Stick::Vertical
+                } else {
+                    Stick::Sideways { fired: false }
+                };
+                self.update(x, y)
+            }
+            Stick::Centred => (0.0, 0),
+            Stick::Vertical if mag < STICK_DEADZONE => {
+                *self = Stick::Centred;
+                (0.0, 0)
+            }
+            Stick::Vertical if vertical => {
+                // Ramps from 0 at the dead zone's edge.
+                let out = (mag - STICK_DEADZONE) / (1.0 - STICK_DEADZONE);
+                (out.min(1.0).copysign(y), 0)
+            }
+            Stick::Vertical => (0.0, 0),
+            Stick::Sideways { .. } if mag < STICK_RECENTRE => {
+                *self = Stick::Centred;
+                (0.0, 0)
+            }
+            Stick::Sideways { fired: false } if sideways && mag > FLICK => {
+                *self = Stick::Sideways { fired: true };
+                (0.0, if x > 0.0 { 1 } else { -1 })
+            }
+            Stick::Sideways { .. } => (0.0, 0),
+        }
+    }
 }
 
 pub struct Input {
@@ -52,8 +120,8 @@ pub struct Input {
     /// Interaction profile last logged per hand (None: not yet).
     profiles: [Option<xr::Path>; 2],
     spaces: [xr::Space; 2],
-    /// Per hand: a sideways stick flick must return to centre before the next.
-    flick_ready: [bool; 2],
+    /// Per hand: what the stick is doing.
+    sticks: [Stick; 2],
     /// Per hand: origin and direction filters.
     filters: [[OneEuro; 2]; 2],
 }
@@ -327,7 +395,7 @@ impl Input {
             repeats: Default::default(),
             profiles: [None; 2],
             spaces,
-            flick_ready: [true; 2],
+            sticks: [Stick::Centred; 2],
             // Direction: unit vector (rad/s-ish speeds); origin: metres.
             filters: [[OneEuro::new(3.0, 6.0), OneEuro::new(1.5, 0.6)]; 2],
         })
@@ -375,16 +443,14 @@ impl Input {
             }
             let stick = self.scroll.state(&ctx.session, hand)?;
             if stick.is_active {
-                let (x, y) = (stick.current_state.x, stick.current_state.y);
-                if y.abs() > state.scroll.abs() {
-                    state.scroll = y;
+                let (out, flick) =
+                    self.sticks[i].update(stick.current_state.x, stick.current_state.y);
+                state.stick[i] = out;
+                if out.abs() > state.scroll.abs() {
+                    state.scroll = out;
                 }
-                // A clearly sideways flick seeks; it must return to centre first.
-                if x.abs() < 0.3 {
-                    self.flick_ready[i] = true;
-                } else if self.flick_ready[i] && x.abs() > 0.8 && x.abs() > 2.0 * y.abs() {
-                    self.flick_ready[i] = false;
-                    state.seek = if x > 0.0 { 1 } else { -1 };
+                if flick != 0 {
+                    state.seek = flick;
                 }
             }
             if self.aim.is_active(&ctx.session, hand)? {

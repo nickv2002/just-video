@@ -9,7 +9,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -132,6 +132,18 @@ enum Block {
     Ready(Vec<u8>),
 }
 
+/// What the reader holds, for a buffer indicator: the read position, the
+/// file length and the byte ranges already fetched (sorted, disjoint).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Buffered {
+    pub position: u64,
+    pub len: u64,
+    pub ranges: Vec<(u64, u64)>,
+}
+
+/// A live view of a reader's [`Buffered`] state, shared with the UI.
+pub type BufferWatch = Arc<Mutex<Buffered>>;
+
 /// How often a read waiting for its block logs (the request itself keeps
 /// running: cancelling it would leak SMB credits).
 const BLOCK_WAIT: Duration = Duration::from_secs(10);
@@ -203,6 +215,7 @@ pub struct ReadAheadReader<S: BlockSource> {
     /// A read waiting this long (at least; see `hedge_wait`) for a block asks
     /// again (see `with_hedge`).
     hedge_after: Option<Duration>,
+    watch: BufferWatch,
 }
 
 /// See [`ReadAheadReader::with_cancel`].
@@ -240,6 +253,49 @@ impl<S: BlockSource> ReadAheadReader<S> {
             measured: (Instant::now(), 0),
             measured_rate: 0.0,
             hedge_after: None,
+            watch: Arc::new(Mutex::new(Buffered {
+                position: 0,
+                len,
+                ranges: Vec::new(),
+            })),
+        }
+    }
+
+    /// The reader's buffer state, kept up to date as it reads.
+    pub fn watch(&self) -> BufferWatch {
+        self.watch.clone()
+    }
+
+    /// Publishes the fetched ranges (contiguous runs of ready blocks).
+    fn publish(&self) {
+        let size = self.options.block_size as u64;
+        // Ready blocks, and those kept after the reader moved away.
+        let mut ready: Vec<u64> = self
+            .blocks
+            .iter()
+            .filter(|(_, block)| matches!(block, Block::Ready(_)))
+            .map(|(&index, _)| index)
+            .chain(self.cache.iter().map(|(index, _)| *index))
+            .collect();
+        ready.sort_unstable();
+        ready.dedup();
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for index in ready {
+            let (start, end) = (index * size, ((index + 1) * size).min(self.len));
+            match ranges.last_mut() {
+                Some(last) if last.1 == start => last.1 = end,
+                _ => ranges.push((start, end)),
+            }
+        }
+        let state = Buffered {
+            position: self.pos,
+            len: self.len,
+            ranges,
+        };
+        if let Ok(mut shared) = self.watch.lock()
+            && *shared != state
+        {
+            *shared = state;
         }
     }
 
@@ -644,6 +700,7 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
         self.pos += n as u64;
         self.stats.bytes_delivered += n as u64;
         self.measured.1 += n as u64;
+        self.publish();
         Ok(n)
     }
 }
@@ -796,6 +853,34 @@ mod tests {
         let mut buf = [0u8; 10];
         r.read_exact(&mut buf).unwrap();
         assert_eq!(r.stats().requests, 1);
+    }
+
+    #[test]
+    fn watch_reports_fetched_ranges() {
+        let (mut reader, _) = reader(
+            10 * 1024,
+            1,
+            ReadAhead {
+                block_size: 1024,
+                blocks_ahead: 4,
+            },
+        );
+        let watch = reader.watch();
+        assert_eq!(watch.lock().unwrap().len, 10 * 1024);
+        let mut buf = [0u8; 100];
+        reader.read_exact(&mut buf).unwrap();
+        let state = watch.lock().unwrap().clone();
+        assert_eq!(state.position, 100);
+        assert_eq!(state.ranges.first().map(|r| r.0), Some(0));
+        // Reading on waits for the rest of the window, which becomes one run.
+        std::thread::sleep(Duration::from_millis(30));
+        reader.seek(SeekFrom::Start(3000)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+        let state = watch.lock().unwrap().clone();
+        assert!(
+            state.ranges.iter().any(|&(a, b)| a <= 3000 && b >= 4096),
+            "{state:?}"
+        );
     }
 
     #[test]

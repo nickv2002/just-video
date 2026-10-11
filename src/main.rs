@@ -460,15 +460,31 @@ fn open_input(
     input: &str,
     read_ahead: ReadAhead,
 ) -> anyhow::Result<(Box<dyn Source>, Option<SmbSession>)> {
+    let (source, session, _) = open_input_watched(input, read_ahead)?;
+    Ok((source, session))
+}
+
+/// An opened input: the source, the SMB session keeping it alive, and the
+/// network reader's buffer state (none for local files).
+type Input = (
+    Box<dyn Source>,
+    Option<SmbSession>,
+    Option<just_video::readahead::BufferWatch>,
+);
+
+/// [`open_input`], plus the reader's buffer state.
+fn open_input_watched(input: &str, read_ahead: ReadAhead) -> anyhow::Result<Input> {
     if input.starts_with("smb://") {
         let session = connect(input)?;
         let path = session.url().path.clone();
         let reader = session.open(&path, read_ahead)?;
-        Ok((Box::new(reader), Some(session)))
+        let watch = reader.watch();
+        Ok((Box::new(reader), Some(session), Some(watch)))
     } else {
         let file = std::fs::File::open(input).with_context(|| format!("Open {input}"))?;
         Ok((
             Box::new(std::io::BufReader::with_capacity(1 << 20, file)),
+            None,
             None,
         ))
     }
@@ -478,6 +494,7 @@ type PlaybackSource = (
     Box<dyn Source>,
     Vec<std::sync::Arc<SmbSession>>,
     Option<(std::sync::Arc<just_video::read_metrics::ReadMetrics>, u64)>,
+    Option<just_video::readahead::BufferWatch>,
 );
 
 /// Like [`open_input`] for playing: an SMB file is read over the video's
@@ -486,7 +503,7 @@ type PlaybackSource = (
 fn open_playback(input: &str, read_ahead: &ReadAheadArgs) -> anyhow::Result<PlaybackSource> {
     if !input.starts_with("smb://") {
         let (source, _) = open_input(input, ReadAhead::default())?;
-        return Ok((source, Vec::new(), None));
+        return Ok((source, Vec::new(), None, None));
     }
     let sessions = connect_lanes(input, read_ahead)?;
     let url = sessions[0].url().clone();
@@ -499,7 +516,8 @@ fn open_playback(input: &str, read_ahead: &ReadAheadArgs) -> anyhow::Result<Play
         )?)
         .for_playback();
     let stream = (reader.metrics(), reader.len());
-    Ok((Box::new(reader), sessions, Some(stream)))
+    let watch = reader.watch();
+    Ok((Box::new(reader), sessions, Some(stream), Some(watch)))
 }
 
 /// Remembers every read of a run (for `bench --replay`).
@@ -743,6 +761,7 @@ fn bench_thumbnails(a: BenchThumbnailsArgs) -> anyhow::Result<()> {
         server: server.clone(),
         share: a.share.clone(),
         path: path.clone(),
+        watch: Default::default(),
     });
     let listed: Vec<ProbeVideo> = loop {
         match recv(Duration::from_secs(30)) {
@@ -1101,7 +1120,7 @@ fn main() -> anyhow::Result<()> {
             read_ahead,
         } => {
             // As the app plays: over the video's connections, the buffer sized in seconds.
-            let (source, _sessions, stream) = open_playback(&input, &read_ahead)?;
+            let (source, _sessions, stream, buffer) = open_playback(&input, &read_ahead)?;
             let media = Media::open(file_name(&input), source)?;
             if let Some((metrics, bytes)) = stream
                 && media.info().duration_seconds > 1.0
@@ -1132,7 +1151,10 @@ fn main() -> anyhow::Result<()> {
             } else {
                 eprintln!("Decoder: {}", decoder.stats().decoder);
             }
-            let playback = just_video::xr::player::Playback::start(decoder, layout, start, 0.7);
+            let mut playback = just_video::xr::player::Playback::start(decoder, layout, start, 0.7);
+            if let Some(buffer) = buffer {
+                playback.set_buffer(buffer);
+            }
             let stats = just_video::xr::app::run(
                 None,
                 Some(playback),
@@ -1202,6 +1224,7 @@ fn main() -> anyhow::Result<()> {
                 server: index.clone(),
                 share: share.clone(),
                 path: path.clone(),
+                watch: Default::default(),
             });
             let Response::List { result, .. } = wait("list")? else {
                 anyhow::bail!("unexpected")
@@ -1330,6 +1353,7 @@ fn main() -> anyhow::Result<()> {
                     server: index.clone(),
                     share: share.clone(),
                     path: path.clone(),
+                    watch: Default::default(),
                 });
                 loop {
                     if let Response::List { .. } = wait("list after stop")? {
@@ -1496,9 +1520,7 @@ fn main() -> anyhow::Result<()> {
             }))?;
         }
         Command::UiPreview { dir } => {
-            use just_video::ui::browser::{
-                Action, Dialog, Icon, Row, Tool, ToolIcon, View, render,
-            };
+            use just_video::ui::browser::{Dialog, Icon, Row, Tool, View, render};
             use just_video::ui::form::{Field, Form};
             let mut fonts = just_video::ui::canvas::Fonts::load()?;
             std::fs::create_dir_all(&dir)?;
@@ -1511,29 +1533,37 @@ fn main() -> anyhow::Result<()> {
             let crumbs = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             let folder = View {
                 crumbs: crumbs(&["Just Video", "NAS", "media", "Videos", "VR"]),
-                tools: vec![Tool::text("Cancel", false), Tool::text("Delete 2", true)],
+                heading: Some("2 selected".into()),
+                tools: vec![
+                    Tool::text("Cancel", false),
+                    Tool::text("Delete 2", true),
+                    Tool::text("Move 2", false),
+                ],
                 rows: vec![
                     Row {
                         outlined: true,
                         ..row(Icon::Folder, "Concerts", "", "")
                     },
-                    row(
-                        Icon::Video(Some(Verdict::Software)),
-                        "Documentary.2160p.HDR.mkv",
-                        "Plays with CPU decoding (4K 60 fps 10-bit HEVC)",
-                        "28.2 GB",
-                    ),
+                    Row {
+                        progress: Some(0.42),
+                        ..row(
+                            Icon::Video(Some(Verdict::Software)),
+                            "Documentary.2160p.HDR.mkv",
+                            "4K 60 fps 10-bit HEVC",
+                            "28.2 GB",
+                        )
+                    },
                     row(
                         Icon::Video(Some(Verdict::Hardware)),
                         "h264.mp4",
-                        "Plays with hardware decoding (1080p 24 fps 8-bit H.264)",
+                        "1080p 24 fps 8-bit H.264",
                         "1.8 GB",
                     ),
                     row(Icon::Video(None), "h265.mkv", "Checking…", "88.4 MB"),
                     row(
                         Icon::Video(Some(Verdict::Unplayable)),
                         "concert_8k.mp4",
-                        "Can't play smoothly on Steam Frame (8K 60 fps 10-bit HEVC)",
+                        "8K 60 fps 10-bit HEVC",
                         "5.1 GB",
                     ),
                     row(Icon::Broken, "damaged.mp4", "Can't read this file", "12 KB"),
@@ -1665,7 +1695,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             thumbs.rows[1].outlined = true;
-            thumbs.tools = vec![Tool::icon(ToolIcon::Thumbnails, true)];
+            thumbs.tools = vec![Tool::icon(just_video::ui::browser::ToolIcon::Thumbnails, true)];
             just_video::ui::save_png(
                 &render(&thumbs, &mut fonts, Some((700.0, 310.0)), true),
                 &dir.join("thumbnails.png"),
@@ -1681,10 +1711,7 @@ fn main() -> anyhow::Result<()> {
                 &dir.join("thumbnails-select.png"),
             )?;
             let mut off = videos.clone();
-            off.tools = vec![
-                Tool::icon(ToolIcon::Thumbnails, false),
-                Tool::icon(ToolIcon::Edit, false),
-            ];
+            off.tools = vec![Tool::icon(just_video::ui::browser::ToolIcon::Thumbnails, false)];
             just_video::ui::save_png(
                 &render(&off, &mut fonts, None, false),
                 &dir.join("thumbnails-off.png"),
@@ -1695,17 +1722,13 @@ fn main() -> anyhow::Result<()> {
                     Row {
                         detail: "smb://user@192.168.1.10".into(),
                         actions: vec![
-                            just_video::ui::browser::Action::Edit,
+                            just_video::ui::browser::Action::Settings,
                             just_video::ui::browser::Action::Remove,
                         ],
                         ..Row::new(Icon::Server, "NAS")
                     },
                     Row {
                         detail: "smb://user@10.0.0.2".into(),
-                        actions: vec![
-                            just_video::ui::browser::Action::Edit,
-                            just_video::ui::browser::Action::Remove,
-                        ],
                         ..Row::new(Icon::Server, "PC")
                     },
                     Row {
@@ -1715,6 +1738,10 @@ fn main() -> anyhow::Result<()> {
                     Row {
                         detail: "Jump lengths, volume, continuing videos".into(),
                         ..Row::new(Icon::Settings, "Settings")
+                    },
+                    Row {
+                        detail: "Close just-video".into(),
+                        ..Row::new(Icon::Exit, "Exit")
                     },
                 ],
                 ..Default::default()
@@ -1731,19 +1758,16 @@ fn main() -> anyhow::Result<()> {
                 &render(&settings, &mut fonts, Some((700.0, 400.0)), true),
                 &dir.join("settings.png"),
             )?;
-            // Edit mode: rename/delete on each row.
-            let mut editing = folder.clone();
-            editing.tools = vec![
-                Tool::icon(ToolIcon::Select, false),
-                Tool::icon(ToolIcon::Edit, true),
-            ];
-            for row in &mut editing.rows {
+            // Nothing held: crumbs instead of the heading, no ticks or tools.
+            let mut browsing = folder.clone();
+            browsing.heading = None;
+            browsing.tools.clear();
+            for row in &mut browsing.rows {
                 row.checked = None;
-                row.actions = vec![Action::Rename, Action::Delete];
             }
             just_video::ui::save_png(
-                &render(&editing, &mut fonts, Some((700.0, 400.0)), true),
-                &dir.join("editing.png"),
+                &render(&browsing, &mut fonts, Some((700.0, 400.0)), true),
+                &dir.join("browsing.png"),
             )?;
             let mut adding = servers.clone();
             adding.form = Some(Form::new(
@@ -1819,6 +1843,7 @@ fn main() -> anyhow::Result<()> {
                 },
                 position: 754.0,
                 duration: 5530.0,
+                buffered: vec![(754.0, 790.0), (2400.0, 2460.0)],
                 has_previous: true,
                 has_next: false,
                 curved: Some(true),

@@ -525,6 +525,7 @@ struct RawFrame {
     full_range: i32,
     transfer: i32,
     hardware: i32,
+    key: i32,
 }
 
 unsafe extern "C" {
@@ -812,6 +813,11 @@ impl Frame {
             Some(Owned::Shared(buffer)) => Some(buffer),
             _ => None,
         }
+    }
+
+    /// The decoder flagged this frame as a keyframe.
+    pub fn key(&self) -> bool {
+        self.raw.key != 0
     }
 
     /// Bytes per sample: 1 for 8-bit, 2 for 10-bit.
@@ -1745,6 +1751,7 @@ mod detach_tests {
             full_range: 0,
             transfer: 0,
             hardware: 1,
+            key: 0,
         };
         Frame {
             raw,

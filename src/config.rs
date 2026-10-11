@@ -257,13 +257,16 @@ struct Resume {
     /// Played to the end (`seconds` is then unused).
     #[serde(default)]
     watched: bool,
+    /// The video's length, for showing how much was watched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration: Option<f64>,
 }
 
 /// What is remembered about a video's progress.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Place {
-    /// Left part way, at this many seconds.
-    Resume(f64),
+    /// Left part way, at this many seconds (of a video this long, if known).
+    Resume(f64, Option<f64>),
     /// Played to (near) the end.
     Watched,
 }
@@ -273,7 +276,7 @@ impl Resume {
         if self.watched {
             Place::Watched
         } else {
-            Place::Resume(self.seconds)
+            Place::Resume(self.seconds, self.duration)
         }
     }
 }
@@ -287,7 +290,7 @@ static RESUME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Where to continue a file from, if it was left part way.
 pub fn resume_position(key: &str) -> Option<f64> {
     match places().get(key) {
-        Some(Place::Resume(seconds)) => Some(*seconds),
+        Some(Place::Resume(seconds, _)) => Some(*seconds),
         _ => None,
     }
 }
@@ -300,9 +303,10 @@ pub fn places() -> BTreeMap<String, Place> {
         .unwrap_or_default()
 }
 
-/// Remembers (or with `None`, forgets) where a file was left.
-pub fn save_resume_position(key: &str, seconds: Option<f64>) -> anyhow::Result<()> {
-    update_place(key, |_| seconds.map(Place::Resume))
+/// Remembers (or with `None`, forgets) where a file was left, with the
+/// video's length when known (so the browser can show how much was watched).
+pub fn save_resume_position(key: &str, point: Option<(f64, Option<f64>)>) -> anyhow::Result<()> {
+    update_place(key, |_| point.map(|(seconds, of)| Place::Resume(seconds, of)))
 }
 
 /// Records a video stopped at `position`: where to continue, or watched.
@@ -321,16 +325,18 @@ fn update_place(key: &str, f: impl FnOnce(Option<Place>) -> Option<Place>) -> an
             let saved = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            let (seconds, watched) = match place {
-                Place::Resume(seconds) => (seconds, false),
-                Place::Watched => (0.0, true),
+            let (seconds, watched, duration) = match place {
+                Place::Resume(seconds, duration) => (seconds, false, duration),
+                Place::Watched => (0.0, true, None),
             };
+            let duration = duration.filter(|d| *d > 0.0);
             all.insert(
                 key.to_string(),
                 Resume {
                     seconds,
                     saved,
                     watched,
+                    duration,
                 },
             );
             while all.len() > MAX_RESUMES {
@@ -352,7 +358,7 @@ fn update_place(key: &str, f: impl FnOnce(Option<Place>) -> Option<Place>) -> an
 /// only opened briefly stays watched.
 pub fn stop_place(position: f64, duration: f64, previous: Option<Place>) -> Option<Place> {
     if let Some(seconds) = resume_point(position, duration) {
-        return Some(Place::Resume(seconds));
+        return Some(Place::Resume(seconds, Some(duration)));
     }
     if position >= 10.0 {
         return Some(Place::Watched); // past the point worth resuming: near the end
@@ -361,11 +367,46 @@ pub fn stop_place(position: f64, duration: f64, previous: Option<Place>) -> Opti
 }
 
 pub fn move_resume_position(from: &str, to: &str) -> anyhow::Result<()> {
-    if let Some(seconds) = resume_position(from) {
-        save_resume_position(from, None)?;
-        save_resume_position(to, Some(seconds))?;
+    if let Some(place) = places().remove(from) {
+        update_place(from, |_| None)?;
+        update_place(to, |_| Some(place))?;
     }
     Ok(())
+}
+
+/// Carries saved video settings with a moved file or an entire folder tree.
+pub fn move_file_state(from: &str, to: &str) -> anyhow::Result<()> {
+    let mut layouts: BTreeMap<String, LayoutOverride> = read_json("layouts.json")?;
+    if remap_file_keys(&mut layouts, from, to) {
+        write_json("layouts.json", &layouts, false)?;
+    }
+    let _guard = RESUME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut resumes: BTreeMap<String, Resume> = read_json("resume.json")?;
+    if remap_file_keys(&mut resumes, from, to) {
+        write_json("resume.json", &resumes, false)?;
+    }
+    Ok(())
+}
+
+fn remap_file_keys<T>(entries: &mut BTreeMap<String, T>, from: &str, to: &str) -> bool {
+    if from == to {
+        return false;
+    }
+    let keys: Vec<_> = entries
+        .keys()
+        .filter_map(|key| {
+            let suffix = key.strip_prefix(from)?;
+            (suffix.is_empty() || suffix.starts_with('/'))
+                .then(|| (key.clone(), format!("{to}{suffix}")))
+        })
+        .collect();
+    let changed = !keys.is_empty();
+    for (old, new) in keys {
+        if let Some(value) = entries.remove(&old) {
+            entries.insert(new, value);
+        }
+    }
+    changed
 }
 
 /// The place worth remembering for a video stopped at `position`: none near
@@ -608,16 +649,16 @@ mod tests {
     fn stopping_near_the_end_marks_watched() {
         let (d, none) = (3600.0, None);
         assert_eq!(stop_place(5.0, d, none), None);
-        assert_eq!(stop_place(754.0, d, none), Some(Place::Resume(754.0)));
+        assert_eq!(stop_place(754.0, d, none), Some(Place::Resume(754.0, Some(d))));
         assert_eq!(stop_place(3590.0, d, none), Some(Place::Watched));
         assert_eq!(stop_place(3500.0, d, none), Some(Place::Watched)); // past 95%
         // A watched video peeked at for a moment stays watched; a resume point is dropped.
         assert_eq!(stop_place(2.0, d, Some(Place::Watched)), Some(Place::Watched));
-        assert_eq!(stop_place(2.0, d, Some(Place::Resume(900.0))), None);
+        assert_eq!(stop_place(2.0, d, Some(Place::Resume(900.0, Some(d)))), None);
         // Watching it again part way replaces the mark.
         assert_eq!(
             stop_place(600.0, d, Some(Place::Watched)),
-            Some(Place::Resume(600.0))
+            Some(Place::Resume(600.0, Some(d)))
         );
     }
 
@@ -744,7 +785,7 @@ mod tests {
             Some(l)
         );
         assert_eq!(resume_position(key), None);
-        save_resume_position(key, Some(754.0)).unwrap();
+        save_resume_position(key, Some((754.0, Some(5400.0)))).unwrap();
         move_resume_position(key, "smb://alice@192.168.1.10/media/VR/renamed.mp4").unwrap();
         assert_eq!(resume_position(key), None);
         assert_eq!(
@@ -771,7 +812,7 @@ mod tests {
             writable: false,
         };
         save_server(moved.clone(), "secret").unwrap();
-        save_resume_position("smb://alice@192.168.1.100/x.mp4", Some(60.0)).unwrap();
+        save_resume_position("smb://alice@192.168.1.100/x.mp4", Some((60.0, None))).unwrap();
         move_server(&server.url, &moved.url).unwrap();
         assert_eq!(servers().unwrap(), vec![moved.clone(), nas.clone()]);
         assert_eq!(password(&server.url).unwrap(), None);
@@ -791,12 +832,33 @@ mod tests {
         save_stop(done, 3.0, 3600.0).unwrap();
         assert_eq!(places().get(done), Some(&Place::Watched));
         save_stop(done, 900.0, 3600.0).unwrap();
-        assert_eq!(places().get(done), Some(&Place::Resume(900.0)));
+        assert_eq!(places().get(done), Some(&Place::Resume(900.0, Some(3600.0))));
         assert!(remove_server("NAS").unwrap());
         let server = moved;
         assert!(remove_server("Office PC").unwrap());
         assert!(servers().unwrap().is_empty());
         assert_eq!(password(&server.url).unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn moved_folder_keeps_descendant_settings_without_matching_sibling_prefixes() {
+        let mut entries = BTreeMap::from([
+            ("server/share/old".into(), 1),
+            ("server/share/old/nested/movie.mp4".into(), 2),
+            ("server/share/older/movie.mp4".into(), 3),
+            ("server/other/old/movie.mp4".into(), 4),
+        ]);
+        assert!(remap_file_keys(
+            &mut entries,
+            "server/share/old",
+            "server/share/new/old"
+        ));
+        assert_eq!(entries["server/share/new/old"], 1);
+        assert_eq!(entries["server/share/new/old/nested/movie.mp4"], 2);
+        assert_eq!(entries["server/share/older/movie.mp4"], 3);
+        assert_eq!(entries["server/other/old/movie.mp4"], 4);
+        assert!(!entries.contains_key("server/share/old"));
+        assert!(!remap_file_keys(&mut entries, "missing", "new"));
     }
 }
