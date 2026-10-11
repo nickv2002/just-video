@@ -9,7 +9,7 @@
 //!
 //! The server list also leads to the Settings screen ([`super::settings`]).
 
-use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, format_size};
+use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, Watch, format_size};
 use super::controls::format_time;
 use super::form::{self, Field, Form, Key};
 use super::settings::{self, Setting};
@@ -768,6 +768,12 @@ impl Navigator {
                         },
                         right: format_size(*size),
                         thumbnail: self.thumbs.get(name).cloned(),
+                        watch: match (broken, self.place_of(name)) {
+                            (Some(_), _) => None,
+                            (None, None) => Some(Watch::Unwatched),
+                            (None, Some(Place::Resume(..))) => Some(Watch::Partial),
+                            (None, Some(Place::Watched)) => Some(Watch::Watched),
+                        },
                         progress: match self.place_of(name) {
                             Some(Place::Resume(at, Some(length))) if length > 0.0 => {
                                 Some((at / length) as f32)
@@ -2118,6 +2124,60 @@ mod tests {
             names(&nav),
             ["alpha", "zeta", "a.mp4", "b.mp4", "c.mp4", "notes.txt"]
         );
+    }
+
+    #[test]
+    fn rows_carry_watched_states_in_the_order_the_sort_gives() {
+        use crate::ui::browser::Watch;
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+            writable: false,
+        };
+        nav.show_entries_for_test(server.clone(), &["dir"]);
+        nav.items.extend([
+            video("done.mp4", 1),
+            video("new.mp4", 2),
+            video("half.mp4", 3),
+            Item::File {
+                name: "notes.txt".into(),
+                size: 1,
+            },
+        ]);
+        let key = |n: &str| crate::library::file_key(&server, "s", &vec![n.to_string()]);
+        nav.places.insert(key("done.mp4"), Place::Watched);
+        nav.places
+            .insert(key("half.mp4"), Place::Resume(60.0, Some(600.0)));
+        nav.sort = SortMode::Unwatched;
+        nav.sort_items();
+        let marks: Vec<_> = nav.view().rows.iter().map(|r| r.watch).collect();
+        assert_eq!(
+            marks,
+            [
+                None,
+                Some(Watch::Partial),
+                Some(Watch::Unwatched),
+                Some(Watch::Watched),
+                None
+            ],
+            "folder, then half, new, done, then the non-video"
+        );
+        assert_eq!(
+            names(&nav),
+            ["dir", "half.mp4", "new.mp4", "done.mp4", "notes.txt"]
+        );
+        // A file that can't be read is not "unwatched".
+        nav.items.push(Item::Video {
+            name: "bad.mp4".into(),
+            size: 1,
+            assessment: None,
+            broken: Some("bad".into()),
+            modified: 0,
+            layout: None,
+        });
+        nav.rebuild_rows();
+        assert_eq!(nav.view().rows.last().unwrap().watch, None);
     }
 
     #[test]

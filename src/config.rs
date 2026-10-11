@@ -507,7 +507,8 @@ pub enum SortMode {
     Name,
     /// Largest first.
     Size,
-    /// Started videos, then unseen ones, then watched ones.
+    /// Started videos, then unwatched ones, then watched ones: half-filled
+    /// marks, then filled, then empty rings.
     Unwatched,
 }
 
@@ -524,7 +525,7 @@ impl SortMode {
         match self {
             SortMode::Name => "A-Z",
             SortMode::Size => "Size",
-            SortMode::Unwatched => "Unseen",
+            SortMode::Unwatched => "Unwatched",
         }
     }
 }
