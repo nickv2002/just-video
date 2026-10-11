@@ -832,7 +832,9 @@ impl Navigator {
                 None => Vec::new(),
             }
         };
-        if self.selecting.is_none() && videos >= 2 {
+        // Only when nothing else is going on: not while selecting, moving or loading.
+        let plain = self.selecting.is_none() && tools.is_empty();
+        if plain && videos >= 2 {
             let label = format!("Sort: {}", self.sort.label());
             let auto = Tool {
                 active: self.autoplay,
@@ -842,7 +844,7 @@ impl Navigator {
             tools.insert(0, (Tool::text(label, false), ToolAction::CycleSort));
         }
         // The thumbnails toggle leads the header. Only where there are videos, and not while picking what to delete.
-        if self.selecting.is_none() && self.in_video_folder() {
+        if plain && self.in_video_folder() {
             let thumbnails = Tool::icon(ToolIcon::Thumbnails, self.prefs.thumbnails);
             tools.insert(0, (thumbnails, ToolAction::ToggleThumbnails));
         }
