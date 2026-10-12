@@ -360,6 +360,29 @@ mod tests {
     }
 
     #[test]
+    fn a_server_row_reaches_its_settings_with_right() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let mut v = View {
+            crumbs: vec!["Just Video".into()],
+            ..View::default()
+        };
+        for name in ["NAS", "PC"] {
+            let mut row = Row::new(Icon::Server, name);
+            row.actions = vec![Action::Settings];
+            v.rows.push(row);
+        }
+        let first = initial(&v, &mut fonts).unwrap();
+        assert_eq!(opens_on_right(&v, &first), None, "right goes to the button");
+        let button = step(&v, &mut fonts, first, Dir::Right);
+        assert_eq!(button.hit, Hit::RowAction(0, Action::Settings));
+        round_trips(&v, &mut fonts, &button);
+        assert_eq!(step(&v, &mut fonts, button, Dir::Right), button, "edge");
+        assert_eq!(step(&v, &mut fonts, button, Dir::Left).hit, Hit::Row(0));
+        let down = step(&v, &mut fonts, button, Dir::Down);
+        assert_eq!(down.hit, Hit::RowAction(1, Action::Settings), "stays on the button column");
+    }
+
+    #[test]
     fn left_on_a_row_goes_up_a_level() {
         let mut fonts = Fonts::load().expect("fonts");
         let mut v = view(5);

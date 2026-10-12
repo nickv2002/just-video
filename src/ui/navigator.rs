@@ -719,10 +719,11 @@ impl Navigator {
                 let mut row = match item {
                     Item::Server(s) => Row {
                         detail: s.url.clone(),
+                        // Settings is always there to find; holding adds Remove.
                         actions: if selecting.is_some_and(|sel| sel.contains(&i)) {
                             vec![Action::Settings, Action::Remove]
                         } else {
-                            Vec::new()
+                            vec![Action::Settings]
                         },
                         ..Row::new(Icon::Server, &s.name)
                     },
@@ -2581,13 +2582,17 @@ mod tests {
             Item::AddServer,
         ];
         nav.rebuild_rows();
-        assert!(nav.view().rows.iter().all(|r| r.actions.is_empty()));
+        // Every server shows Settings; Remove waits for the hold.
+        for i in 0..2 {
+            assert_eq!(nav.view().rows[i].actions, vec![Action::Settings]);
+        }
+        assert!(nav.view().rows[2].actions.is_empty(), "Add server");
         nav.long_press(1);
         assert_eq!(
             nav.view().rows[1].actions,
             vec![Action::Settings, Action::Remove]
         );
-        assert!(nav.view().rows[0].actions.is_empty());
+        assert_eq!(nav.view().rows[0].actions, vec![Action::Settings]);
         assert!(nav.view().rows.iter().all(|r| r.checked.is_none()));
         assert_eq!(nav.view().tools.len(), 1, "cancel");
         nav.click(Hit::RowAction(1, Action::Settings));
@@ -2595,9 +2600,36 @@ mod tests {
         nav.back();
         nav.long_press(1);
         assert!(nav.back(), "B closes the buttons");
-        assert!(nav.view().rows[1].actions.is_empty());
+        assert_eq!(nav.view().rows[1].actions, vec![Action::Settings]);
         nav.long_press(2);
         assert!(nav.selecting.is_none(), "nothing to hold on Add server");
+    }
+
+    #[test]
+    fn a_server_row_always_offers_its_settings() {
+        let mut nav = Navigator::new(Library::start(None));
+        nav.items = vec![
+            Item::Server(Server {
+                name: "NAS".into(),
+                url: "smb://u@nas".into(),
+                writable: false,
+            }),
+            Item::Server(Server {
+                name: "PC".into(),
+                url: "smb://u@pc".into(),
+                writable: false,
+            }),
+        ];
+        nav.rebuild_rows();
+        assert_eq!(nav.selecting, None);
+        nav.click(Hit::RowAction(0, Action::Settings));
+        let form = nav.view().form.as_ref().expect("edit form");
+        assert_eq!(form.title, "Edit NAS");
+        assert!(matches!(nav.purpose, Some(Purpose::EditServer(ref u)) if u == "smb://u@nas"));
+        nav.back();
+        assert!(nav.view().form.is_none());
+        // A tap on the row itself still opens the server, not the form.
+        assert_eq!(nav.view().rows[1].actions, vec![Action::Settings]);
     }
 
     #[test]
@@ -2612,7 +2644,7 @@ mod tests {
             Item::AddServer,
         ];
         nav.rebuild_rows();
-        assert!(nav.view().rows[0].actions.is_empty());
+        assert_eq!(nav.view().rows[0].actions, vec![Action::Settings]);
         nav.long_press(0);
         let row = &nav.view().rows[0];
         assert_eq!(row.actions, vec![Action::Settings, Action::Remove]);

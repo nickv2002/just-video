@@ -1346,6 +1346,43 @@ mod tests {
     }
 
     #[test]
+    fn a_server_row_draws_and_hits_its_settings_button() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let mut view = View {
+            crumbs: vec!["Just Video".into()],
+            rows: vec![
+                Row {
+                    detail: "smb://user@nas".into(),
+                    actions: vec![Action::Settings],
+                    ..Row::new(Icon::Server, "NAS")
+                },
+                Row::new(Icon::Add, "Add server"),
+            ],
+            ..Default::default()
+        };
+        let (ax, ay, aw, ah) = action_rect(&view, 0, 0);
+        assert!(aw >= 120.0 && ah >= 60.0, "a VR-sized target: {aw}x{ah}");
+        let (rx, _, rw, _) = row_rect(&view, 0);
+        assert!(ax + aw <= rx + rw, "inside the row");
+        let (cx, cy) = (ax + aw / 2.0, ay + ah / 2.0);
+        assert_eq!(
+            hit(&view, &mut fonts, cx, cy),
+            Hit::RowAction(0, Action::Settings)
+        );
+        assert_eq!(hit(&view, &mut fonts, rx + 40.0, cy), Hit::Row(0));
+        // The button is painted: its corner differs from the bare row.
+        let canvas = render(&view, &mut fonts, None, false);
+        let px = |c: &Canvas, x: f32, y: f32| {
+            let i = ((y as u32 * c.width + x as u32) * 4) as usize;
+            [c.pixels[i], c.pixels[i + 1], c.pixels[i + 2]]
+        };
+        let (bx, by) = (ax + 20.0, ay + 8.0);
+        view.rows[0].actions.clear();
+        let bare = render(&view, &mut fonts, None, false);
+        assert_ne!(px(&canvas, bx, by), px(&bare, bx, by));
+    }
+
+    #[test]
     fn row_actions_and_tools() {
         let mut view = view();
         let mut fonts = Fonts::load().expect("fonts");

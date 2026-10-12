@@ -1765,6 +1765,7 @@ fn main() -> anyhow::Result<()> {
                     },
                     Row {
                         detail: "smb://user@10.0.0.2".into(),
+                        actions: vec![just_video::ui::browser::Action::Settings],
                         ..Row::new(Icon::Server, "PC")
                     },
                     Row {
