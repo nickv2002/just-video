@@ -543,8 +543,15 @@ void jv_decoder_close(JVDecoder *d) {
 // has nothing to decode into. 8K takes all the memory it can have (see the
 // notes on FFmpeg's default of 20 failing there).
 static int capture_buffer_count(int64_t pixels) {
-    return pixels > 4096 * 2304 ? 6 : pixels > 1920 * 1088 ? 12 : 20;
+    return pixels > 4096 * 2304 ? 6 : pixels > 1280 * 720 ? 12 : 20;
 }
+
+// Output (bitstream) buffers: each is sized for the worst packet of the
+// stream's resolution (6.7 MiB at 1080p, 16 MiB at 6K) and is resident once
+// the driver has touched it, so 16 of them (FFmpeg's default) held 108 MiB at
+// 1080p and 256 MiB at 6K. The decoder takes packets in order and hands them
+// back as it parses them, so a handful keeps it fed.
+#define OUTPUT_BUFFERS 6
 
 JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_software,
                            const char *decoder_options, JVDecodeStats *s) {
@@ -588,7 +595,7 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
             // FFmpeg's default of 20 capture buffers fails to allocate at 8K.
             int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
             av_dict_set_int(&open_options, "num_capture_buffers", capture_buffer_count(pixels), 0);
-            av_dict_set_int(&open_options, "num_output_buffers", 16, 0);
+            av_dict_set_int(&open_options, "num_output_buffers", OUTPUT_BUFFERS, 0);
         } else if (!allow_software) {
             ret = AVERROR(ENOSYS);
             snprintf(s->error, sizeof(s->error), "%s", why);
@@ -646,7 +653,7 @@ reopen:
         av_dict_free(&open_options);
         int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
         av_dict_set_int(&open_options, "num_capture_buffers", capture_buffer_count(pixels), 0);
-        av_dict_set_int(&open_options, "num_output_buffers", 16, 0);
+        av_dict_set_int(&open_options, "num_output_buffers", OUTPUT_BUFFERS, 0);
         goto reopen;
     }
     if (ret < 0 && d->choice.hardware_wrapper && allow_software) {
@@ -703,7 +710,7 @@ int jv_decoder_reopen_video(JVDecoder *d, int try_hardware, int free_behind) {
         if (hardware) {
             int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
             av_dict_set_int(&options, "num_capture_buffers", capture_buffer_count(pixels), 0);
-            av_dict_set_int(&options, "num_output_buffers", 16, 0);
+            av_dict_set_int(&options, "num_output_buffers", OUTPUT_BUFFERS, 0);
         }
         ret = avcodec_open2(d->ctx, codec, &options);
         av_dict_free(&options);
@@ -748,7 +755,7 @@ int jv_decoder_return_to_hardware(JVDecoder *d) {
     AVDictionary *options = NULL;
     int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
     av_dict_set_int(&options, "num_capture_buffers", capture_buffer_count(pixels), 0);
-    av_dict_set_int(&options, "num_output_buffers", 16, 0);
+    av_dict_set_int(&options, "num_output_buffers", OUTPUT_BUFFERS, 0);
     ret = avcodec_open2(ctx, d->hw_codec, &options);
     av_dict_free(&options);
     if (ret < 0) {
