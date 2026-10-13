@@ -29,6 +29,9 @@ libc = "0.2"
 libloading = "0.9"
 openxr = "0.21"
 png = "0.18"
+# Thumbnail cache files (src/thumb_cache.rs).
+jpeg-encoder = "0.7"
+zune-jpeg = "0.5"
 ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 ctrlc = "3"
 rpassword = "7"

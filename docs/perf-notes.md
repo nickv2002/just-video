@@ -533,3 +533,49 @@ about 600 MB, as estimated (530 MB).
 replacements (58-81 ms, all hardware, no CPU), jumps ready median 286 ms (worst 534), longest read wait 273 ms,
 RSS 685 -> 1180 MiB (max 1201, +1.1 MiB/min after minute 1, i.e. buffer growth to its 88 MiB aim), threads
 17-20, fds 101-141, steady, no errors. Conclusion: the pool works at 8K and is not worse; keep it on by default.
+
+## Memory footprint (2026-10-12)
+
+1080p HEVC over SMB on the Frame used 620 MiB after 80 s and ~790 MiB after 10 minutes (not a leak). Where it went,
+by `smaps` and an allocation-site profile (an `LD_PRELOAD` malloc tracker on the headset):
+
+| | before | change | after |
+|---|---|---|---|
+| UI fonts (fontdue held every glyph of Noto Sans CJK) | ~165 MiB live + ~150 MiB freed scratch | font files mapped, glyphs rasterized when first drawn (`src/ui/glyphs.rs`) | 620 -> 277 MiB at 80 s |
+| V4L2 bitstream buffers (16, 6.7 MiB each at 1080p, 16 MiB at 6K, resident once touched) | 108 MiB / ~256 MiB | 6 | 1080p 269 -> 177 MiB, 6K 756-797 -> 597 MiB |
+| capture buffers at 1080p | 20 (3 MiB each) | 12 | -24 MiB |
+| reader's kept blocks (jump back, A-B loop) | up to 192 MiB | 60 s of the stream's rate, 32-192 MiB | 12.5 min run: 325 -> 175 MiB |
+
+Checked with 3 alternating pairs each, same jump scripts and a 120 ms frame-loop hitch every 2 s: skips, missed display
+periods and `nothing decoded` are the same, jump/seek ready times are the same or lower, decoder replacements 12-25 ms.
+6K for 5 minutes (2 pairs): 755 -> 598 MiB, flat; 0-9 display periods missed old, 6-21 new, out of ~18000 (not seen
+in the 100 s runs, which had 315-323 missed in every variant because of the injected hitches). 8K for 3 minutes, new
+build only: 677 MiB (1171 MiB with the old defaults), hardware decoder, 0 replacements, 8 missed. What is left at 1080p
+is `RssFile` ~108 MiB (binary, shared libraries, the Vulkan driver), the decoder's capture mappings, and ~65 MiB of
+anonymous memory.
+
+## Thumbnail cache format (2026-10-12)
+
+The list thumbnails (220 x 124, opaque) were stored as PNG, ~50 KB each, decoded when a row is first drawn. 19 real
+thumbnails from the headset's cache, medians per image, on the dev PC (x86-64) and the Frame (Cortex-A720, one thread):
+
+| format (crate) | bytes | PSNR | decode PC / Frame | encode PC / Frame |
+|---|---|---|---|---|
+| PNG (`png`, current) | 49 661 | lossless | 0.53 / 0.77-0.93 ms | 6.4 / 7-8 ms |
+| JPEG q85 4:2:0 (`jpeg-encoder`, `zune-jpeg`) | 7 473 | 34.1 dB | 0.07 / 0.13-0.17 ms | 0.19 / 0.2 ms |
+| **JPEG q90 4:4:4** (same) | 11 576 | 38.3 dB | 0.10 / 0.24-0.26 ms | 0.33 / 0.4 ms |
+| WebP lossy q80 / q90 (libwebp via ffmpeg; `image-webp` decodes) | 4 456 / 6 973 | 34.8 / 37.2 dB | 0.44-0.51 / 0.67-0.80 ms | needs libwebp (C) |
+| JPEG XL d1.0 / d1.5, effort 4 (`cjxl`; `jxl-oxide` decodes) | 8 007 / 5 893 | 37.2 / 35.0 dB | 7.0 / 11.0-11.3 ms | no permissive pure-Rust lossy encoder |
+
+- JPEG XL is the smallest per quality only against JPEG, and its pure-Rust decoder is 10x slower than PNG here. The
+  one pure-Rust lossy encoder (`jxl-encoder`) is AGPL / commercial, which does not fit an MIT project; `jpegxl-rs`
+  would bring libjxl (C++) into the cross build.
+- AVIF would need rav1e (slow, pure Rust) or libaom to write, a container, and dav1d's API for reading. A rough
+  check with dav1d through ffmpeg put a 224x128 still at a few tenths of a millisecond, no faster than JPEG; not
+  measured properly, since it would add an encoder and a container for no decode-time gain.
+- WebP is the smallest at equal quality but decodes at PNG speed, which is the cost that matters while scrolling a grid.
+- JPEG is 3-6x faster to decode than PNG and 4-7x smaller; chosen: **q90, no chroma subsampling** (38 dB, 4.3x smaller,
+  decode 0.24-0.26 ms on the Frame against 0.8-0.9). Licences: `zune-jpeg` MIT/Apache-2.0/Zlib, `jpeg-encoder`
+  MIT/Apache-2.0; both pure Rust, ~100 KB of code. The cache holds at most 5000 files: 58 MB instead of 250 MB.
+- Old PNG files are not read; they are never served and are not pruned by the new code (the project has no users with a
+  cache to migrate). The in-memory `Thumb` stays RGBA.
