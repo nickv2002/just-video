@@ -163,6 +163,12 @@ const INITIAL_WINDOW: usize = 4;
 /// that come back (an MP4 index at the end of the file, then the start of the
 /// data), and for jumps back into what was just played (~15 s of 6K60).
 const KEPT_BYTES: usize = 192 << 20;
+/// With the stream's rate known, only this much of it is kept behind the
+/// reader (at most `KEPT_BYTES`): a low-bitrate file's 192 MiB would be many
+/// minutes of video, far more than a jump back or an A-B loop revisits.
+const KEPT_SECONDS: f64 = 60.0;
+/// ...but never less than this: the blocks around a keyframe, the index.
+const KEPT_MIN_BYTES: usize = 32 << 20;
 /// Reads in flight at most, however large the window: they can't be
 /// cancelled, so after a jump the new position's data arrives only after
 /// them. Over the headset's Wi-Fi 3 keep 8K (~50 Mbit/s) fed with no stall,
@@ -410,8 +416,18 @@ impl<S: BlockSource> ReadAheadReader<S> {
             .sum()
     }
 
+    /// Blocks kept behind the reader: [`KEPT_SECONDS`] of the stream at its
+    /// rate (its own if known, else what the reader sees consumed), between
+    /// `KEPT_MIN_BYTES` and `KEPT_BYTES`; the most while the rate is unknown.
     fn kept_blocks(&self) -> usize {
-        (KEPT_BYTES / self.options.block_size).max(1)
+        let hint = self.metrics.rate_hint() as f64;
+        let rate = if hint > 0.0 { hint } else { self.measured_rate };
+        let bytes = if self.adaptive.is_some() && rate > 0.0 {
+            ((rate * KEPT_SECONDS) as usize).clamp(KEPT_MIN_BYTES, KEPT_BYTES)
+        } else {
+            KEPT_BYTES
+        };
+        (bytes / self.options.block_size).max(1)
     }
 
     fn spawn(&mut self, index: u64) {
@@ -490,7 +506,8 @@ impl<S: BlockSource> ReadAheadReader<S> {
             match self.blocks.remove(&index) {
                 Some(Block::Pending(handle)) => self.detached.push(handle),
                 Some(Block::Ready(data)) => {
-                    if self.cache.len() >= self.kept_blocks() {
+                    let kept = self.kept_blocks();
+                    while self.cache.len() >= kept {
                         self.cache.pop_front();
                     }
                     self.cache.push_back((index, data));
@@ -1269,6 +1286,28 @@ mod tests {
         assert!(most <= 50 + 2, "held {most} blocks");
         assert!(most >= 40, "never filled the buffer: {most}");
         assert!(r.cache.len() * BLOCK <= KEPT_BYTES);
+    }
+
+    #[test]
+    fn kept_blocks_follow_the_stream_rate_within_limits() {
+        const MIB: usize = 1 << 20;
+        let mut r = spiky_reader(2, 0..0).with_adaptive(Adaptive::default());
+        let kept = |r: &ReadAheadReader<Spiky>| r.kept_blocks() * BLOCK;
+        let near = |got: usize, want: usize| got.abs_diff(want) < BLOCK;
+        // Rate unknown: as much as is allowed.
+        assert!(near(kept(&r), KEPT_BYTES));
+        // 1 MiB/s: a minute of it.
+        r.metrics().set_rate_hint(MIB as u64);
+        assert!(near(kept(&r), 60 * MIB));
+        // Slow streams keep the minimum, fast ones the cap.
+        r.metrics().set_rate_hint(100_000);
+        assert!(near(kept(&r), KEPT_MIN_BYTES));
+        r.metrics().set_rate_hint(13 * MIB as u64);
+        assert!(near(kept(&r), KEPT_BYTES));
+        // Without the adaptive buffer (no rate to go by) the cap applies.
+        let plain = spiky_reader(2, 0..0);
+        plain.metrics().set_rate_hint(MIB as u64);
+        assert!(near(kept(&plain), KEPT_BYTES));
     }
 
     #[test]
