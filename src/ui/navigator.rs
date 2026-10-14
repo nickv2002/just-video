@@ -3,8 +3,7 @@
 //!
 //! Holding select on an entry selects it: the header then offers Delete,
 //! Move and (for one entry) Rename or Start over in place of the
-//! breadcrumbs, and other entries can be ticked. Holding select on a server
-//! reveals its Edit and Delete buttons. Files can only be changed on
+//! breadcrumbs, and other entries can be ticked. Each server row has Edit and Delete buttons. Files can only be changed on
 //! servers that allow it in their settings ("Allow changing files").
 //!
 //! The server list also leads to the Settings screen ([`super::settings`]).
@@ -180,8 +179,7 @@ pub struct Navigator {
     view: View,
     purpose: Option<Purpose>,
     /// Entries held and ticked, to move, delete, rename or start over
-    /// (the header shows the tools). On the server list, the one server
-    /// showing its Edit and Delete buttons.
+    /// (the header shows the tools).
     selecting: Option<HashSet<usize>>,
     /// Sources survive navigation until a destination is chosen or cancelled.
     moving: Option<MoveSelection>,
@@ -720,12 +718,7 @@ impl Navigator {
                 let mut row = match item {
                     Item::Server(s) => Row {
                         detail: s.url.clone(),
-                        // Edit is always there to find; holding adds Delete.
-                        actions: if selecting.is_some_and(|sel| sel.contains(&i)) {
-                            vec![Action::Edit, Action::Delete]
-                        } else {
-                            vec![Action::Edit]
-                        },
+                        actions: vec![Action::Edit, Action::Delete],
                         ..Row::new(Icon::Server, &s.name)
                     },
                     Item::AddServer => Row {
@@ -1395,16 +1388,15 @@ impl Navigator {
         self.dirty = true;
     }
 
-    /// A long press on a row: edit mode with that entry selected (a server
-    /// shows its Edit and Delete buttons).
+    /// A long press on a row: edit mode with that entry selected (not on
+    /// servers, whose Edit and Delete buttons are always shown).
     pub fn long_press(&mut self, index: usize) {
         if self.moving.is_some() || !self.pending_changes.is_empty() {
             return;
         }
         match self.items.get(index) {
-            Some(Item::Server(_)) => {
-                self.selecting = Some(HashSet::from([index]));
-            }
+            // A server's Edit and Delete are always on its row.
+            Some(Item::Server(_)) => {}
             Some(item) if item.is_entry() => {
                 if !self.editing() {
                     self.view.notice = Some(
@@ -2593,7 +2585,7 @@ mod tests {
     }
 
     #[test]
-    fn holding_a_server_reveals_its_buttons() {
+    fn every_server_row_shows_edit_and_delete() {
         let mut nav = Navigator::new(Library::start(None));
         nav.items = vec![
             Item::Server(Server {
@@ -2609,27 +2601,24 @@ mod tests {
             Item::AddServer,
         ];
         nav.rebuild_rows();
-        // Every server shows Edit; Delete waits for the hold.
         for i in 0..2 {
-            assert_eq!(nav.view().rows[i].actions, vec![Action::Edit]);
+            assert_eq!(
+                nav.view().rows[i].actions,
+                vec![Action::Edit, Action::Delete]
+            );
         }
         assert!(nav.view().rows[2].actions.is_empty(), "Add server");
         nav.long_press(1);
-        assert_eq!(
-            nav.view().rows[1].actions,
-            vec![Action::Edit, Action::Delete]
-        );
-        assert_eq!(nav.view().rows[0].actions, vec![Action::Edit]);
-        assert!(nav.view().rows.iter().all(|r| r.checked.is_none()));
-        assert_eq!(nav.view().tools.len(), 1, "cancel");
+        assert!(nav.selecting.is_none(), "holding a server does nothing");
         nav.click(Hit::RowAction(1, Action::Edit));
         assert!(matches!(nav.purpose, Some(Purpose::EditServer(ref u)) if u == "smb://u@pc"));
         nav.back();
-        nav.long_press(1);
-        assert!(nav.back(), "B closes the buttons");
-        assert_eq!(nav.view().rows[1].actions, vec![Action::Edit]);
-        nav.long_press(2);
-        assert!(nav.selecting.is_none(), "nothing to hold on Add server");
+        // Delete asks first, without opening the form.
+        nav.click(Hit::RowAction(1, Action::Delete));
+        assert!(nav.view().form.is_none());
+        assert_eq!(nav.view().dialog.as_ref().unwrap().title, "Delete PC?");
+        assert!(nav.back());
+        assert!(!nav.dialog_open());
     }
 
     #[test]
@@ -2656,7 +2645,10 @@ mod tests {
         nav.back();
         assert!(nav.view().form.is_none());
         // A tap on the row itself still opens the server, not the form.
-        assert_eq!(nav.view().rows[1].actions, vec![Action::Edit]);
+        assert_eq!(
+            nav.view().rows[1].actions,
+            vec![Action::Edit, Action::Delete]
+        );
     }
 
     #[test]
@@ -2671,10 +2663,10 @@ mod tests {
             Item::AddServer,
         ];
         nav.rebuild_rows();
-        assert_eq!(nav.view().rows[0].actions, vec![Action::Edit]);
-        nav.long_press(0);
-        let row = &nav.view().rows[0];
-        assert_eq!(row.actions, vec![Action::Edit, Action::Delete]);
+        assert_eq!(
+            nav.view().rows[0].actions,
+            vec![Action::Edit, Action::Delete]
+        );
 
         nav.click(Hit::RowAction(0, Action::Delete));
         assert!(nav.dialog_open(), "removing asks first");
@@ -2740,8 +2732,7 @@ mod tests {
         assert_eq!(config::password(&nas.url).unwrap(), None);
         assert_eq!(nav.view().rows.iter().filter(|r| r.icon == Icon::Server).count(), 1);
 
-        // Holding a row offers the same Delete, with the same confirmation.
-        nav.long_press(0);
+        // The row's own Delete asks the same, and Cancel keeps the server.
         nav.click(Hit::RowAction(0, Action::Delete));
         assert_eq!(nav.view().dialog.as_ref().unwrap().title, "Delete PC?");
         nav.click(Hit::DialogButton(0));
