@@ -170,6 +170,8 @@ pub struct State {
     pub caption_edit: bool,
     /// The A-B loop (marks on the seek bar, button state).
     pub ab_loop: AbLoop,
+    /// The A-B loop setting: off hides the button and the marks.
+    pub ab_loop_enabled: bool,
 }
 
 type Rect = (f32, f32, f32, f32);
@@ -228,7 +230,7 @@ pub fn hit(state: &State, x: f32, y: f32) -> Hit {
         (PREVIOUS, Hit::Previous, state.has_previous),
         (PLAY, Hit::PlayPause, true),
         (NEXT, Hit::Next, state.has_next),
-        (LOOP, Hit::Loop, state.duration > 0.0),
+        (LOOP, Hit::Loop, state.ab_loop_enabled && state.duration > 0.0),
         (CAPTIONS, Hit::Captions, can_caption),
         (SCREEN, Hit::Screen, true),
         (IMAGE, Hit::Image, true),
@@ -561,10 +563,12 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
     };
     label_under(&mut c, fonts, CAPTIONS, &caption_label);
 
-    let looping = state.ab_loop.a().is_some();
-    button(&mut c, LOOP, hover == Hit::Loop, looping);
-    centered(&mut c, fonts, "A-B", LOOP, 34.0, TEXT);
-    label_under(&mut c, fonts, LOOP, state.ab_loop.label());
+    if state.ab_loop_enabled {
+        let looping = state.ab_loop.a().is_some();
+        button(&mut c, LOOP, hover == Hit::Loop, looping);
+        centered(&mut c, fonts, "A-B", LOOP, 34.0, TEXT);
+        label_under(&mut c, fonts, LOOP, state.ab_loop.label());
+    }
 
     let screen_fill = if hover == Hit::Screen { HOVER } else { BUTTON };
     button(&mut c, SCREEN, hover == Hit::Screen, false);
@@ -625,7 +629,7 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
         }
     }
     c.rect(sx, track_y - 6.0, sw * fraction, 12.0, 6.0, ACCENT);
-    if state.duration > 0.0 {
+    if state.ab_loop_enabled && state.duration > 0.0 {
         for mark in [state.ab_loop.a(), state.ab_loop.b()].into_iter().flatten() {
             let x = sx + sw * (mark / state.duration).clamp(0.0, 1.0) as f32;
             c.rect(x - 3.0, track_y - 20.0, 6.0, 40.0, 3.0, SUBTLE);
@@ -797,6 +801,7 @@ mod tests {
             dialog: None,
             caption_edit: false,
             ab_loop: AbLoop::default(),
+            ab_loop_enabled: true,
         }
     }
 
@@ -825,6 +830,13 @@ mod tests {
             assert_eq!(hit(&s, x, y), h);
             assert!(r.0 + r.2 <= WIDTH as f32 && r.1 + r.3 <= HEIGHT as f32);
         }
+        // With the A-B loop setting off its button isn't there.
+        let off = State {
+            ab_loop_enabled: false,
+            ..state()
+        };
+        let (x, y) = center(LOOP);
+        assert_eq!(hit(&off, x, y), Hit::Nothing);
         let with_subs = State {
             subtitle_tracks: vec!["English".into()],
             ..s

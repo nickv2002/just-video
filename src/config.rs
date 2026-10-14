@@ -485,6 +485,8 @@ pub struct Preferences {
     pub resume: bool,
     /// Thumbnails in video lists.
     pub thumbnails: bool,
+    /// The A-B loop button on the player bar.
+    pub ab_loop: bool,
 }
 
 impl Default for Preferences {
@@ -495,6 +497,7 @@ impl Default for Preferences {
             volume_step: 10,
             resume: true,
             thumbnails: false,
+            ab_loop: false,
         }
     }
 }
@@ -733,6 +736,20 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["settings.json"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_ab_loop_is_off_by_default_and_persists() {
+        let dir = temp_config("ab-loop-pref");
+        assert!(!Preferences::default().ab_loop);
+        // Settings saved before the option existed have it off.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"player":{"short_jump":10}}"#).unwrap();
+        assert!(!preferences().ab_loop);
+        update_preferences(|p| p.ab_loop = true).unwrap();
+        assert!(preferences().ab_loop);
+        assert_eq!(preferences().short_jump, 10);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

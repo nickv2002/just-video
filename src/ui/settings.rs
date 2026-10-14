@@ -10,13 +10,15 @@ pub enum Setting {
     LongJump,
     VolumeStep,
     Resume,
+    AbLoop,
 }
 
-pub const ALL: [Setting; 4] = [
+pub const ALL: [Setting; 5] = [
     Setting::ShortJump,
     Setting::LongJump,
     Setting::VolumeStep,
     Setting::Resume,
+    Setting::AbLoop,
 ];
 
 const SHORT_JUMPS: &[u32] = &[5, 10, 15, 30];
@@ -65,6 +67,11 @@ impl Setting {
                 "Start videos from where they were stopped",
                 if p.resume { "On" } else { "Off" }.to_string(),
             ),
+            Setting::AbLoop => (
+                "A-B loop",
+                "A loop button on the player bar to repeat a section",
+                if p.ab_loop { "On" } else { "Off" }.to_string(),
+            ),
         };
         Row {
             detail: detail.into(),
@@ -80,6 +87,7 @@ impl Setting {
             Setting::LongJump => p.long_jump = next(LONG_JUMPS, p.long_jump),
             Setting::VolumeStep => p.volume_step = next(VOLUME_STEPS, p.volume_step),
             Setting::Resume => p.resume = !p.resume,
+            Setting::AbLoop => p.ab_loop = !p.ab_loop,
         }
     }
 }
@@ -112,6 +120,16 @@ mod tests {
         Setting::Resume.cycle(&mut p);
         assert!(!p.resume);
         assert_eq!(Setting::Resume.row(&p).right, "Off");
+    }
+
+    #[test]
+    fn the_ab_loop_row_toggles_and_defaults_off() {
+        let mut p = Preferences::default();
+        assert!(ALL.contains(&Setting::AbLoop));
+        assert_eq!(Setting::AbLoop.row(&p).right, "Off");
+        Setting::AbLoop.cycle(&mut p);
+        assert!(p.ab_loop);
+        assert_eq!(Setting::AbLoop.row(&p).right, "On");
     }
 
     #[test]

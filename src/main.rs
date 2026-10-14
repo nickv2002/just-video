@@ -1895,6 +1895,7 @@ fn main() -> anyhow::Result<()> {
                     l.press(2500.0);
                     l
                 },
+                ab_loop_enabled: true,
                 position: 754.0,
                 duration: 5530.0,
                 buffered: vec![(754.0, 790.0), (2400.0, 2460.0)],

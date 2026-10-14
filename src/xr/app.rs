@@ -988,7 +988,8 @@ pub fn run(
                     Action::Pause => playback.toggle_pause(state.predicted_display_time.as_nanos()),
                     Action::JumpTo(t) => playback.seek(t),
                     Action::JumpBy(d) => playback.seek(playback.position() + d),
-                    Action::Loop => ab_loop.press(playback.position()),
+                    Action::Loop if prefs.ab_loop => ab_loop.press(playback.position()),
+                    Action::Loop => {}
                     Action::Off => script_off = true,
                     Action::On => script_off = false,
                 }
@@ -1135,6 +1136,9 @@ pub fn run(
                 }
                 if let Some(changed) = nav.take_preferences() {
                     prefs = changed;
+                    if !prefs.ab_loop {
+                        ab_loop.clear();
+                    }
                 }
                 if let Some(opened) = nav.poll() {
                     playing_key = Some(opened.key.clone());
@@ -1479,6 +1483,7 @@ pub fn run(
                     dialog,
                     caption_edit,
                     ab_loop,
+                    ab_loop_enabled: prefs.ab_loop,
                 };
                 // The pointer on the dialog (above the bar) or on the bar.
                 let dialog_at = controls_panel_at
@@ -1641,7 +1646,8 @@ pub fn run(
                 match clicked {
                     Some(controls::Hit::PlayPause) => playback.toggle_pause(now),
                     Some(controls::Hit::Seek(f)) => playback.seek(f as f64 * playback.duration),
-                    Some(controls::Hit::Loop) => ab_loop.press(playback.position()),
+                    Some(controls::Hit::Loop) if prefs.ab_loop => ab_loop.press(playback.position()),
+                    Some(controls::Hit::Loop) => {}
                     Some(controls::Hit::Previous) => switch_video = Some(-1),
                     Some(controls::Hit::Next) => switch_video = Some(1),
                     // CC: subtitles on/off (or, with none, straight to audio tracks).
@@ -2477,6 +2483,7 @@ mod tests {
         let state = controls::State {
             paused: false,
             ab_loop: Default::default(),
+            ab_loop_enabled: true,
             position: 754.0,
             duration: 5530.0,
             buffered: vec![(754.0, 760.0)],
