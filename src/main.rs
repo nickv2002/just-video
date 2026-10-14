@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use just_video::{
+use video_box::{
     media::{Media, Source},
     playability::{self, Assessment, Platform, Verdict},
     readahead::ReadAhead,
@@ -13,10 +13,10 @@ use std::{
     time::Instant,
 };
 
-/// Just Video: VR playback straight from SMB shares.
+/// Video Box: VR playback straight from SMB shares.
 ///
 /// Inputs are `smb://[domain;]user@host[:port]/share/path` or local paths. The
-/// SMB password comes from JUST_VIDEO_SMB_PASSWORD or an interactive prompt.
+/// SMB password comes from VIDEO_BOX_SMB_PASSWORD or an interactive prompt.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -376,7 +376,7 @@ struct ReadAheadArgs {
     #[arg(long, default_value_t = 32)]
     blocks_ahead: usize,
     /// SMB connections the file is read over (as when playing).
-    #[arg(long, default_value_t = just_video::library::VIDEO_CONNECTIONS)]
+    #[arg(long, default_value_t = video_box::library::VIDEO_CONNECTIONS)]
     connections: usize,
     /// Fixed read-ahead: this many reads in flight, `--blocks-ahead` the
     /// window (the old behaviour). 0: the buffer sizes itself in seconds.
@@ -389,11 +389,11 @@ struct ReadAheadArgs {
     #[arg(long, default_value_t = 160)]
     buffer_mib: usize,
     /// Most reads in flight for the self-sizing buffer.
-    #[arg(long, default_value_t = just_video::readahead::Adaptive::default().in_flight)]
+    #[arg(long, default_value_t = video_box::readahead::Adaptive::default().in_flight)]
     buffer_in_flight: usize,
     /// A read waiting this long (ms) for its block asks again over another
     /// connection (0: never).
-    #[arg(long, default_value_t = just_video::readahead::HEDGE_FLOOR.as_millis() as u64)]
+    #[arg(long, default_value_t = video_box::readahead::HEDGE_FLOOR.as_millis() as u64)]
     hedge_ms: u64,
 }
 
@@ -409,14 +409,14 @@ fn connect_lanes(
 
 impl ReadAheadArgs {
     /// Applies the buffer policy: as playing does, or the fixed one.
-    fn tune(&self, reader: just_video::smb::SmbReader) -> just_video::smb::SmbReader {
+    fn tune(&self, reader: video_box::smb::SmbReader) -> video_box::smb::SmbReader {
         let reader = reader.with_hedge(
             (self.hedge_ms > 0).then(|| std::time::Duration::from_millis(self.hedge_ms)),
         );
         if self.max_in_flight > 0 {
             return reader.with_max_in_flight(self.max_in_flight);
         }
-        reader.with_adaptive(just_video::readahead::Adaptive {
+        reader.with_adaptive(video_box::readahead::Adaptive {
             seconds: self.buffer_seconds,
             max_bytes: self.buffer_mib << 20,
             in_flight: self.buffer_in_flight,
@@ -433,7 +433,7 @@ impl ReadAheadArgs {
 }
 
 fn password() -> anyhow::Result<String> {
-    if let Ok(password) = std::env::var("JUST_VIDEO_SMB_PASSWORD") {
+    if let Ok(password) = std::env::var("VIDEO_BOX_SMB_PASSWORD") {
         return Ok(password);
     }
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -445,9 +445,9 @@ fn password() -> anyhow::Result<String> {
 fn connect(url: &str) -> anyhow::Result<SmbSession> {
     let url: SmbUrl = url.parse()?;
     // A saved server's password is used unless one is given explicitly.
-    let password = match std::env::var("JUST_VIDEO_SMB_PASSWORD") {
+    let password = match std::env::var("VIDEO_BOX_SMB_PASSWORD") {
         Ok(p) => p,
-        Err(_) => match just_video::config::password(&url.server_url())? {
+        Err(_) => match video_box::config::password(&url.server_url())? {
             Some(p) => p,
             None => password()?,
         },
@@ -469,7 +469,7 @@ fn open_input(
 type Input = (
     Box<dyn Source>,
     Option<SmbSession>,
-    Option<just_video::readahead::BufferWatch>,
+    Option<video_box::readahead::BufferWatch>,
 );
 
 /// [`open_input`], plus the reader's buffer state.
@@ -493,8 +493,8 @@ fn open_input_watched(input: &str, read_ahead: ReadAhead) -> anyhow::Result<Inpu
 type PlaybackSource = (
     Box<dyn Source>,
     Vec<std::sync::Arc<SmbSession>>,
-    Option<(std::sync::Arc<just_video::read_metrics::ReadMetrics>, u64)>,
-    Option<just_video::readahead::BufferWatch>,
+    Option<(std::sync::Arc<video_box::read_metrics::ReadMetrics>, u64)>,
+    Option<video_box::readahead::BufferWatch>,
 );
 
 /// Like [`open_input`] for playing: an SMB file is read over the video's
@@ -652,7 +652,7 @@ fn quit_on_ctrl_c() -> anyhow::Result<std::sync::Arc<std::sync::atomic::AtomicBo
 }
 
 /// When launched from Steam there is no terminal: send diagnostics to
-/// ~/.local/state/just-video/log.txt instead.
+/// ~/.local/state/video-box/log.txt instead.
 fn log_to_file_without_terminal() {
     use std::io::IsTerminal;
     if std::io::stderr().is_terminal() {
@@ -661,7 +661,7 @@ fn log_to_file_without_terminal() {
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
-    let dir = std::path::Path::new(&home).join(".local/state/just-video");
+    let dir = std::path::Path::new(&home).join(".local/state/video-box");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -678,23 +678,23 @@ fn log_to_file_without_terminal() {
 fn run_app(quit: std::sync::Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
     log_to_file_without_terminal();
     eprintln!(
-        "Just Video {} ({}) starting",
+        "Video Box {} ({}) starting",
         env!("CARGO_PKG_VERSION"),
-        just_video::ui::browser::BUILD
+        video_box::ui::browser::BUILD
     );
-    let library = just_video::library::Library::start(just_video::media::default_hw_backend());
-    let mut navigator = just_video::ui::navigator::Navigator::new(library);
-    navigator.set_preferences(just_video::config::preferences());
-    just_video::xr::app::run(
+    let library = video_box::library::Library::start(video_box::media::default_hw_backend());
+    let mut navigator = video_box::ui::navigator::Navigator::new(library);
+    navigator.set_preferences(video_box::config::preferences());
+    video_box::xr::app::run(
         Some(navigator),
         None,
-        just_video::xr::app::AppOptions {
+        video_box::xr::app::AppOptions {
             view: Default::default(),
             play: Default::default(),
             quit,
         },
     )?;
-    eprintln!("Just Video stopped");
+    eprintln!("Video Box stopped");
     Ok(())
 }
 
@@ -732,13 +732,13 @@ fn rss_mb() -> f64 {
 
 /// See [`Command::BenchThumbnails`]. Lines starting `BT` are for scripts.
 fn bench_thumbnails(a: BenchThumbnailsArgs) -> anyhow::Result<()> {
-    use just_video::library::{Library, ProbeVideo, Request, Response, ThumbVideo};
+    use video_box::library::{Library, ProbeVideo, Request, Response, ThumbVideo};
     use std::time::{Duration, Instant};
-    let server = just_video::config::servers()?
+    let server = video_box::config::servers()?
         .into_iter()
         .find(|s| s.name == a.server)
         .ok_or_else(|| anyhow::anyhow!("No saved server {}", a.server))?;
-    let library = Library::start(just_video::media::default_hw_backend());
+    let library = Library::start(video_box::media::default_hw_backend());
     let path: Vec<String> = a
         .folder
         .split('/')
@@ -769,7 +769,7 @@ fn bench_thumbnails(a: BenchThumbnailsArgs) -> anyhow::Result<()> {
                 break result
                     .map_err(anyhow::Error::msg)?
                     .into_iter()
-                    .filter(|e| !e.is_dir && just_video::ui::navigator::is_video(&e.name))
+                    .filter(|e| !e.is_dir && video_box::ui::navigator::is_video(&e.name))
                     .filter(|e| a.only.as_ref().is_none_or(|o| e.name.contains(o.as_str())))
                     .map(|e| ProbeVideo {
                         name: e.name,
@@ -800,7 +800,7 @@ fn bench_thumbnails(a: BenchThumbnailsArgs) -> anyhow::Result<()> {
                 if let Ok(p) = result {
                     layouts.insert(name, p.layout);
                 } else {
-                    let l = just_video::vr::detect(&name, None);
+                    let l = video_box::vr::detect(&name, None);
                     layouts.insert(name, l);
                 }
             }
@@ -825,7 +825,7 @@ fn bench_thumbnails(a: BenchThumbnailsArgs) -> anyhow::Result<()> {
             layout: layouts[&v.name],
         })
         .collect();
-    let mut held: Vec<std::sync::Arc<just_video::media::Thumb>> = Vec::new();
+    let mut held: Vec<std::sync::Arc<video_box::media::Thumb>> = Vec::new();
     for pass in 1..=a.passes {
         library.set_thumbnail_generation(pass);
         let sent = Instant::now();
@@ -889,7 +889,7 @@ fn bench_thumbnails(a: BenchThumbnailsArgs) -> anyhow::Result<()> {
                     t0.elapsed().as_secs_f64() * 1e3,
                     rss_mb()
                 );
-                let mut playback = just_video::xr::player::Playback::start(
+                let mut playback = video_box::xr::player::Playback::start(
                     opened.decoder,
                     opened.layout,
                     0.0,
@@ -925,7 +925,7 @@ fn bench_thumbnails(a: BenchThumbnailsArgs) -> anyhow::Result<()> {
                     rss_mb()
                 );
                 got += thumbs_in_play;
-                just_video::xr::app::drop_in_background(playback);
+                video_box::xr::app::drop_in_background(playback);
                 eprintln!("BT playback closed");
                 last = Instant::now();
                 continue;
@@ -987,8 +987,8 @@ fn print(value: serde_json::Value) -> anyhow::Result<()> {
 /// many FFmpeg contexts from several threads; with glibc's defaults the freed
 /// heap stayed resident (a 36-video folder: 270 MB after, 31 MB with this).
 fn trim_freed_memory() {
-    // JUST_VIDEO_NO_TRIM: for comparing with glibc's defaults.
-    if std::env::var_os("JUST_VIDEO_NO_TRIM").is_some() {
+    // VIDEO_BOX_NO_TRIM: for comparing with glibc's defaults.
+    if std::env::var_os("VIDEO_BOX_NO_TRIM").is_some() {
         return;
     }
     // SAFETY: plain call, before other threads exist. Setting the trim
@@ -1002,6 +1002,7 @@ fn trim_freed_memory() {
 
 fn main() -> anyhow::Result<()> {
     trim_freed_memory();
+    video_box::config::migrate_old_dirs();
     let cli = Cli::parse();
     let platform = cli.platform.unwrap_or_else(Platform::current);
     let Some(command) = cli.command else {
@@ -1021,12 +1022,12 @@ fn main() -> anyhow::Result<()> {
             let password = password()?;
             let session = SmbSession::connect(parsed.clone(), password.clone())?;
             let shares = session.shares()?;
-            just_video::config::save_server(
-                just_video::config::Server {
+            video_box::config::save_server(
+                video_box::config::Server {
                     name: name.unwrap_or_else(|| parsed.host.clone()),
                     url: parsed.server_url(),
                     // Saving again keeps whether files may be changed.
-                    writable: just_video::config::servers()
+                    writable: video_box::config::servers()
                         .unwrap_or_default()
                         .iter()
                         .any(|s| s.url == parsed.server_url() && s.writable),
@@ -1041,12 +1042,12 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Command::Servers => {
-            for server in just_video::config::servers()? {
+            for server in video_box::config::servers()? {
                 println!("{}\t{}", server.name, server.url);
             }
         }
         Command::RemoveServer { server } => {
-            if !just_video::config::remove_server(&server)? {
+            if !video_box::config::remove_server(&server)? {
                 anyhow::bail!("No saved server named {server}");
             }
         }
@@ -1151,21 +1152,21 @@ fn main() -> anyhow::Result<()> {
             } else {
                 eprintln!("Decoder: {}", decoder.stats().decoder);
             }
-            let mut playback = just_video::xr::player::Playback::start(decoder, layout, start, 0.7);
+            let mut playback = video_box::xr::player::Playback::start(decoder, layout, start, 0.7);
             if let Some(buffer) = buffer {
                 playback.set_buffer(buffer);
             }
-            let stats = just_video::xr::app::run(
+            let stats = video_box::xr::app::run(
                 None,
                 Some(playback),
-                just_video::xr::app::AppOptions {
-                    view: just_video::xr::player::ViewOptions {
+                video_box::xr::app::AppOptions {
+                    view: video_box::xr::player::ViewOptions {
                         fisheye_fov,
                         screen_width,
                         screen_distance,
                         debug_view,
                     },
-                    play: just_video::xr::player::PlayOptions {
+                    play: video_box::xr::player::PlayOptions {
                         screenshot: screenshot.map(|p| (p, start + screenshot_at)),
                         duration: duration.map(|d| start + d),
                         start,
@@ -1186,16 +1187,16 @@ fn main() -> anyhow::Result<()> {
             click_at_once,
             click_delay_ms,
         } => {
-            use just_video::library::{Library, Request, Response};
+            use video_box::library::{Library, Request, Response};
             use std::time::{Duration, Instant};
-            let index = just_video::config::servers()?
+            let index = video_box::config::servers()?
                 .into_iter()
                 .find(|s| s.name == server)
                 .ok_or_else(|| anyhow::anyhow!("No saved server {server}"))?;
             if cold {
-                let _ = std::fs::remove_file(just_video::config::dir()?.join("probe-cache.json"));
+                let _ = std::fs::remove_file(video_box::config::dir()?.join("probe-cache.json"));
             }
-            let library = Library::start(just_video::media::default_hw_backend());
+            let library = Library::start(video_box::media::default_hw_backend());
             let path: Vec<String> = folder
                 .split('/')
                 .filter(|p| !p.is_empty())
@@ -1229,11 +1230,11 @@ fn main() -> anyhow::Result<()> {
             let Response::List { result, .. } = wait("list")? else {
                 anyhow::bail!("unexpected")
             };
-            let listed: Vec<just_video::library::ProbeVideo> = result
+            let listed: Vec<video_box::library::ProbeVideo> = result
                 .map_err(anyhow::Error::msg)?
                 .into_iter()
-                .filter(|e| !e.is_dir && just_video::ui::navigator::is_video(&e.name))
-                .map(|e| just_video::library::ProbeVideo {
+                .filter(|e| !e.is_dir && video_box::ui::navigator::is_video(&e.name))
+                .map(|e| video_box::library::ProbeVideo {
                     name: e.name,
                     size: e.size,
                     modified: e.modified,
@@ -1294,7 +1295,7 @@ fn main() -> anyhow::Result<()> {
                         _ => continue,
                     }
                 };
-                let mut playback = just_video::xr::player::Playback::start(
+                let mut playback = video_box::xr::player::Playback::start(
                     opened.decoder,
                     opened.layout,
                     0.0,
@@ -1330,7 +1331,7 @@ fn main() -> anyhow::Result<()> {
                     std::thread::sleep(Duration::from_millis(11));
                 }
                 eprintln!("  played {shown} frames, stopping");
-                just_video::xr::app::drop_in_background(playback);
+                video_box::xr::app::drop_in_background(playback);
                 if round == 0 && click_at_once {
                     // Probes paused for the video carry on once it closes.
                     let started = Instant::now();
@@ -1439,13 +1440,13 @@ fn main() -> anyhow::Result<()> {
                 println!("{:8.2} {:8.2}  {what}", c.start, c.end);
             }
             if let (Some(path), Some(image)) = (png, cues.iter().find_map(|c| c.image.clone())) {
-                let mut fonts = just_video::ui::canvas::Fonts::load()?;
-                let caption = just_video::subtitles::Caption {
+                let mut fonts = video_box::ui::canvas::Fonts::load()?;
+                let caption = video_box::subtitles::Caption {
                     text: None,
                     image: Some(image),
                 };
-                just_video::ui::save_png(
-                    &just_video::ui::captions::render(&caption, &mut fonts),
+                video_box::ui::save_png(
+                    &video_box::ui::captions::render(&caption, &mut fonts),
                     &path,
                 )?;
             }
@@ -1457,11 +1458,11 @@ fn main() -> anyhow::Result<()> {
             volume,
             switch_to,
         } => {
-            use just_video::audio::{CHANNELS, Output, RATE};
+            use video_box::audio::{CHANNELS, Output, RATE};
             let (source, _session) = open_input(&input, ReadAhead::default())?;
             let media = Media::open(file_name(&input), source)?;
             let mut decoder =
-                media.into_decoder(just_video::media::default_hw_backend(), true, "")?;
+                media.into_decoder(video_box::media::default_hw_backend(), true, "")?;
             anyhow::ensure!(decoder.enable_audio(RATE, CHANNELS), "No audio track");
             let mut output = Output::open("audio-test")?;
             let (mut frames, mut written, mut expected, mut gaps) = (0u64, 0u64, None::<f64>, 0);
@@ -1520,9 +1521,9 @@ fn main() -> anyhow::Result<()> {
             }))?;
         }
         Command::UiPreview { dir } => {
-            use just_video::ui::browser::{Dialog, Icon, Row, Tool, View, Watch, render};
-            use just_video::ui::form::{Field, Form};
-            let mut fonts = just_video::ui::canvas::Fonts::load()?;
+            use video_box::ui::browser::{Dialog, Icon, Row, Tool, View, Watch, render};
+            use video_box::ui::form::{Field, Form};
+            let mut fonts = video_box::ui::canvas::Fonts::load()?;
             std::fs::create_dir_all(&dir)?;
             let row = |icon, label: &str, detail: &str, right: &str| Row {
                 detail: detail.into(),
@@ -1532,7 +1533,7 @@ fn main() -> anyhow::Result<()> {
             };
             let crumbs = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             let folder = View {
-                crumbs: crumbs(&["Just Video", "NAS", "media", "Videos", "VR"]),
+                crumbs: crumbs(&["Video Box", "NAS", "media", "Videos", "VR"]),
                 heading: Some("2 selected".into()),
                 tools: vec![
                     Tool::text("Cancel", false),
@@ -1581,7 +1582,7 @@ fn main() -> anyhow::Result<()> {
                 ],
                 ..Default::default()
             };
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &render(&folder, &mut fonts, Some((700.0, 400.0)), true),
                 &dir.join("folder-select.png"),
             )?;
@@ -1590,7 +1591,7 @@ fn main() -> anyhow::Result<()> {
             let mut long = folder.clone();
             long.heading = None;
             long.crumbs = crumbs(&[
-                "Just Video",
+                "Video Box",
                 "smb://someone@a-very-long-server-name.example",
                 "Shared Media Archive",
                 "Holiday Recordings From Several Years",
@@ -1598,20 +1599,20 @@ fn main() -> anyhow::Result<()> {
                 "Raw Footage Straight From The Camera",
             ]);
             long.tools = vec![
-                Tool::icon(just_video::ui::browser::ToolIcon::Thumbnails, false),
+                Tool::icon(video_box::ui::browser::ToolIcon::Thumbnails, false),
                 Tool::text("Sort: Unwatched", false),
                 Tool::text("Autoplay", false),
             ];
             for row in &mut long.rows {
                 row.checked = None;
             }
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &render(&long, &mut fonts, Some((700.0, 400.0)), true),
                 &dir.join("folder.png"),
             )?;
             // Flat, 3D and VR videos at each verdict, marked as the browser marks them.
             let video = |name: &str, verdict: Option<Verdict>, title: &str, size: &str| {
-                let layout = just_video::vr::detect(name, None);
+                let layout = video_box::vr::detect(name, None);
                 let detail = match (verdict, layout.short_label()) {
                     (None, _) => "Checking…".to_string(),
                     (Some(_), Some(format)) => format!("{format}  ·  {title}"),
@@ -1626,7 +1627,7 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             let videos = View {
-                crumbs: crumbs(&["Just Video", "NAS", "media", "Mixed"]),
+                crumbs: crumbs(&["Video Box", "NAS", "media", "Mixed"]),
                 rows: vec![
                     video(
                         "Movie.2024.2160p.mkv",
@@ -1701,7 +1702,7 @@ fn main() -> anyhow::Result<()> {
                         rgba.extend_from_slice(&[c(0.0), c(2.1), c(4.2), 255]);
                     }
                 }
-                std::sync::Arc::new(just_video::media::Thumb {
+                std::sync::Arc::new(video_box::media::Thumb {
                     width: w,
                     height: h,
                     rgba,
@@ -1719,7 +1720,7 @@ fn main() -> anyhow::Result<()> {
                     row.detail = format!("Watched · {}", row.detail);
                 }
             }
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &render(&videos, &mut fonts, Some((700.0, 310.0)), true),
                 &dir.join("videos.png"),
             )?;
@@ -1731,8 +1732,8 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             thumbs.rows[1].outlined = true;
-            thumbs.tools = vec![Tool::icon(just_video::ui::browser::ToolIcon::Thumbnails, true)];
-            just_video::ui::save_png(
+            thumbs.tools = vec![Tool::icon(video_box::ui::browser::ToolIcon::Thumbnails, true)];
+            video_box::ui::save_png(
                 &render(&thumbs, &mut fonts, Some((700.0, 310.0)), true),
                 &dir.join("thumbnails.png"),
             )?;
@@ -1742,32 +1743,32 @@ fn main() -> anyhow::Result<()> {
                 row.checked = Some(i % 2 == 0);
             }
             selecting.scroll = 2.0;
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &render(&selecting, &mut fonts, None, false),
                 &dir.join("thumbnails-select.png"),
             )?;
             let mut off = videos.clone();
-            off.tools = vec![Tool::icon(just_video::ui::browser::ToolIcon::Thumbnails, false)];
-            just_video::ui::save_png(
+            off.tools = vec![Tool::icon(video_box::ui::browser::ToolIcon::Thumbnails, false)];
+            video_box::ui::save_png(
                 &render(&off, &mut fonts, None, false),
                 &dir.join("thumbnails-off.png"),
             )?;
             let servers = View {
-                crumbs: crumbs(&["Just Video"]),
+                crumbs: crumbs(&["Video Box"]),
                 rows: vec![
                     Row {
                         detail: "smb://user@192.168.1.10".into(),
                         actions: vec![
-                            just_video::ui::browser::Action::Edit,
-                            just_video::ui::browser::Action::Delete,
+                            video_box::ui::browser::Action::Edit,
+                            video_box::ui::browser::Action::Delete,
                         ],
                         ..Row::new(Icon::Server, "NAS")
                     },
                     Row {
                         detail: "smb://user@10.0.0.2".into(),
                         actions: vec![
-                            just_video::ui::browser::Action::Edit,
-                            just_video::ui::browser::Action::Delete,
+                            video_box::ui::browser::Action::Edit,
+                            video_box::ui::browser::Action::Delete,
                         ],
                         ..Row::new(Icon::Server, "PC")
                     },
@@ -1780,21 +1781,21 @@ fn main() -> anyhow::Result<()> {
                         ..Row::new(Icon::Settings, "Settings")
                     },
                     Row {
-                        detail: "Close just-video".into(),
+                        detail: "Close Video Box".into(),
                         ..Row::new(Icon::Exit, "Exit")
                     },
                 ],
                 ..Default::default()
             };
             let settings = View {
-                crumbs: crumbs(&["Just Video", "Settings"]),
-                rows: just_video::ui::settings::rows(&just_video::config::Preferences {
+                crumbs: crumbs(&["Video Box", "Settings"]),
+                rows: video_box::ui::settings::rows(&video_box::config::Preferences {
                     long_jump: 600,
                     ..Default::default()
                 }),
                 ..Default::default()
             };
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &render(&settings, &mut fonts, Some((700.0, 400.0)), true),
                 &dir.join("settings.png"),
             )?;
@@ -1805,7 +1806,7 @@ fn main() -> anyhow::Result<()> {
             for row in &mut browsing.rows {
                 row.checked = None;
             }
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &render(&browsing, &mut fonts, Some((700.0, 400.0)), true),
                 &dir.join("browsing.png"),
             )?;
@@ -1827,7 +1828,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(f) = &mut adding.form {
                 f.toggle = Some(("Allow changing files".into(), false));
             }
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &render(&adding, &mut fonts, Some((700.0, 700.0)), true),
                 &dir.join("form.png"),
             )?;
@@ -1851,11 +1852,11 @@ fn main() -> anyhow::Result<()> {
                 f.toggle = Some(("Allow changing files".into(), true));
                 f.delete = Some("Delete".into());
             }
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &render(&editing_server, &mut fonts, None, false),
                 &dir.join("form-edit.png"),
             )?;
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &render(&servers, &mut fonts, None, false),
                 &dir.join("servers.png"),
             )?;
@@ -1868,7 +1869,7 @@ fn main() -> anyhow::Result<()> {
                 buttons: vec!["Cancel".into(), "Delete".into()],
                 danger: true,
             });
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &render(&deleting, &mut fonts, Some((800.0, 790.0)), true),
                 &dir.join("server-delete.png"),
             )?;
@@ -1882,15 +1883,15 @@ fn main() -> anyhow::Result<()> {
                 buttons: vec!["OK".into()],
                 danger: false,
             });
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &render(&dialog, &mut fonts, Some((800.0, 790.0)), true),
                 &dir.join("dialog.png"),
             )?;
-            use just_video::ui::controls;
+            use video_box::ui::controls;
             let state = controls::State {
                 paused: true,
                 ab_loop: {
-                    let mut l = just_video::ab_loop::AbLoop::default();
+                    let mut l = video_box::ab_loop::AbLoop::default();
                     l.press(1000.0);
                     l.press(2500.0);
                     l
@@ -1929,7 +1930,7 @@ fn main() -> anyhow::Result<()> {
                 audio_tracks: vec!["English 7.1".into(), "English · Commentary".into()],
                 audio: Some(0),
                 list_page: 0,
-                image: just_video::config::ImageAdjust {
+                image: video_box::config::ImageAdjust {
                     brightness: 0.1,
                     contrast: 1.2,
                     saturation: 1.0,
@@ -1938,7 +1939,7 @@ fn main() -> anyhow::Result<()> {
                 dialog: None,
                 caption_edit: false,
             };
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &controls::render(&state, &mut fonts, controls::Hit::Seek(0.62)),
                 &dir.join("controls.png"),
             )?;
@@ -1946,7 +1947,7 @@ fn main() -> anyhow::Result<()> {
                 caption_edit: true,
                 ..state.clone()
             };
-            just_video::ui::save_png(
+            video_box::ui::save_png(
                 &controls::render(&editing, &mut fonts, controls::Hit::CaptionMove(1)),
                 &dir.join("controls-captions.png"),
             )?;
@@ -1971,26 +1972,26 @@ fn main() -> anyhow::Result<()> {
                     dialog: Some(dialog),
                     ..state.clone()
                 };
-                just_video::ui::save_png(
+                video_box::ui::save_png(
                     &controls::render_dialog(&open, &mut fonts, hover),
                     &dir.join(name),
                 )?;
             }
-            let caption = just_video::ui::captions::render(
-                &just_video::subtitles::Caption::text(
+            let caption = video_box::ui::captions::render(
+                &video_box::subtitles::Caption::text(
                     "Good morning, everyone.\nThe train leaves at noon.",
                 ),
                 &mut fonts,
             );
-            just_video::ui::save_png(&caption, &dir.join("caption.png"))?;
+            video_box::ui::save_png(&caption, &dir.join("caption.png"))?;
         }
         Command::SteamArt { dir } => {
-            use just_video::ui::steam_art;
-            let mut fonts = just_video::ui::canvas::Fonts::load()?;
+            use video_box::ui::steam_art;
+            let mut fonts = video_box::ui::canvas::Fonts::load()?;
             std::fs::create_dir_all(&dir)?;
             for &(name, w, h) in steam_art::PIECES {
                 let art = steam_art::render(name, w, h, &mut fonts);
-                just_video::ui::save_png(&art, &dir.join(name))?;
+                video_box::ui::save_png(&art, &dir.join(name))?;
             }
         }
         Command::Thumbnail {
@@ -2015,7 +2016,7 @@ fn main() -> anyhow::Result<()> {
             let mut layout = vr::detect(&input, video.as_ref());
             override_layout(&mut layout, projection, stereo, swap_eyes);
             let started = std::time::Instant::now();
-            let thumb = just_video::media::thumbnail(
+            let thumb = video_box::media::thumbnail(
                 file_name(&input),
                 source,
                 at,
@@ -2038,7 +2039,7 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Command::XrProbe => {
-            let xr = just_video::xr::context::XrContext::new()?;
+            let xr = video_box::xr::context::XrContext::new()?;
             print(json!({
                 "system": xr.system_name,
                 "gpu": xr.gpu_name(),
@@ -2122,7 +2123,7 @@ fn main() -> anyhow::Result<()> {
             json,
             read_ahead,
         } => {
-            use just_video::bench;
+            use video_box::bench;
             let bench_input = if input.starts_with("smb://") {
                 let started = Instant::now();
                 let sessions = connect_lanes(&input, &read_ahead)?;

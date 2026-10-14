@@ -1,7 +1,7 @@
 //! Run against a disposable local Samba share whose backing directory is given
-//! by JUST_VIDEO_SMB_MOVE_TEST_ROOT and URL by JUST_VIDEO_SMB_MOVE_TEST_URL.
+//! by VIDEO_BOX_SMB_MOVE_TEST_ROOT and URL by VIDEO_BOX_SMB_MOVE_TEST_URL.
 
-use just_video::smb::{SmbSession, SmbUrl};
+use video_box::smb::{SmbSession, SmbUrl};
 use std::path::PathBuf;
 
 struct Fixture(PathBuf);
@@ -16,8 +16,8 @@ impl Drop for Fixture {
 #[ignore = "requires a disposable local Samba share"]
 fn smb_moves_preserve_contents_and_never_overwrite() {
     let root =
-        PathBuf::from(std::env::var("JUST_VIDEO_SMB_MOVE_TEST_ROOT").expect("test share root"));
-    let url: SmbUrl = std::env::var("JUST_VIDEO_SMB_MOVE_TEST_URL")
+        PathBuf::from(std::env::var("VIDEO_BOX_SMB_MOVE_TEST_ROOT").expect("test share root"));
+    let url: SmbUrl = std::env::var("VIDEO_BOX_SMB_MOVE_TEST_URL")
         .expect("test share URL")
         .parse()
         .unwrap();
@@ -54,7 +54,7 @@ fn smb_moves_preserve_contents_and_never_overwrite() {
 
     let session = SmbSession::connect(
         url,
-        std::env::var("JUST_VIDEO_SMB_MOVE_TEST_PASSWORD").unwrap_or_default(),
+        std::env::var("VIDEO_BOX_SMB_MOVE_TEST_PASSWORD").unwrap_or_default(),
     )
     .unwrap();
     let destination = format!("{name}\\destination");

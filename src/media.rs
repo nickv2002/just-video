@@ -891,11 +891,11 @@ impl Frame {
     }
 }
 
-/// Threads copying a large picture (`JUST_VIDEO_COPY_THREADS` to compare).
+/// Threads copying a large picture (`VIDEO_BOX_COPY_THREADS` to compare).
 fn copy_threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("JUST_VIDEO_COPY_THREADS")
+        std::env::var("VIDEO_BOX_COPY_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n >= 1)

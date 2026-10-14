@@ -104,10 +104,10 @@ const ADAPTIVE_IN_FLIGHT: usize = 3;
 /// `ReadAheadReader::with_hedge`; the time is longer on a slow link).
 pub const HEDGE_FLOOR: Duration = Duration::from_millis(200);
 
-/// [`HEDGE_FLOOR`], or what `JUST_VIDEO_HEDGE_MS` says (0: never ask again),
+/// [`HEDGE_FLOOR`], or what `VIDEO_BOX_HEDGE_MS` says (0: never ask again),
 /// for comparing on the headset.
 pub fn hedge_floor() -> Option<Duration> {
-    match std::env::var("JUST_VIDEO_HEDGE_MS")
+    match std::env::var("VIDEO_BOX_HEDGE_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
     {

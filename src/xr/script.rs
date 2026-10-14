@@ -1,5 +1,5 @@
 //! A timed list of actions for testing `play` over SSH with nobody wearing the
-//! headset (`JUST_VIDEO_SCRIPT`): pause, jumps, the A-B loop and taking the
+//! headset (`VIDEO_BOX_SCRIPT`): pause, jumps, the A-B loop and taking the
 //! headset off and putting it on again.
 //!
 //! Format: space- or comma-separated `SECONDS:ACTION`, seconds counted from
@@ -57,9 +57,9 @@ impl Script {
 
     /// From the environment; a bad script is reported and ignored.
     pub fn from_env() -> Self {
-        match std::env::var("JUST_VIDEO_SCRIPT") {
+        match std::env::var("VIDEO_BOX_SCRIPT") {
             Ok(text) => Self::parse(&text).unwrap_or_else(|e| {
-                eprintln!("JUST_VIDEO_SCRIPT: {e}");
+                eprintln!("VIDEO_BOX_SCRIPT: {e}");
                 Self::default()
             }),
             Err(_) => Self::default(),

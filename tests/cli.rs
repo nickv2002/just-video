@@ -102,7 +102,7 @@ fn player_survives_bad_files() {
             vec!["info"],
             vec!["bench", "--frames", "60", "--hw", "none"],
         ] {
-            let output = Command::new(env!("CARGO_BIN_EXE_just-video"))
+            let output = Command::new(env!("CARGO_BIN_EXE_video-box"))
                 .args(&args)
                 .arg(&path)
                 .output()
@@ -127,7 +127,7 @@ fn ten_bit_never_uses_v4l2() {
         eprintln!("skipping: run scripts/make-samples.sh");
         return;
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_just-video"))
+    let output = Command::new(env!("CARGO_BIN_EXE_video-box"))
         .args([
             "--platform",
             "steam-frame",
@@ -156,7 +156,7 @@ fn ten_bit_never_uses_v4l2() {
 #[cfg(feature = "decode")]
 #[test]
 fn decoder_yields_frames_with_planes_and_pts() {
-    use just_video::media::{Media, PlaneLayout};
+    use video_box::media::{Media, PlaneLayout};
     for (name, bits) in [("h264-720p.mp4", 8), ("hevc-main10-720p.mp4", 10)] {
         let path = format!("{}/samples/{name}", env!("CARGO_MANIFEST_DIR"));
         let Ok(file) = std::fs::File::open(&path) else {
@@ -198,7 +198,7 @@ fn decoder_yields_frames_with_planes_and_pts() {
 #[cfg(feature = "decode")]
 #[test]
 fn decoder_counts_frames_alive() {
-    use just_video::media::Media;
+    use video_box::media::Media;
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/samples/h264-720p.mp4");
     let Ok(file) = std::fs::File::open(path) else {
         eprintln!("skipping: run scripts/make-samples.sh");

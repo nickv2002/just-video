@@ -890,7 +890,7 @@ pub fn run(
 
     // Testing over SSH with nobody wearing the headset: the runtime never asks
     // for frames then, so draw them anyway (it just doesn't show them).
-    let render_unseen = std::env::var_os("JUST_VIDEO_RENDER_UNSEEN").is_some();
+    let render_unseen = std::env::var_os("VIDEO_BOX_RENDER_UNSEEN").is_some();
     // Timed pause / jump / A-B / headset-off actions, for tests over SSH.
     let mut script = super::script::Script::from_env();
     let script_start = Instant::now();
@@ -899,7 +899,7 @@ pub fn run(
     // Test aid ("120,2"): block the loop for 120 ms every 2 s, as a busy
     // compositor or CPU does, to see how the picture catches up.
     let test_hitch: Option<(Duration, Duration)> =
-        std::env::var("JUST_VIDEO_TEST_HITCH").ok().and_then(|v| {
+        std::env::var("VIDEO_BOX_TEST_HITCH").ok().and_then(|v| {
             let (ms, every) = v.split_once(',')?;
             Some((
                 Duration::from_secs_f64(ms.parse::<f64>().ok()? / 1e3),
@@ -2470,11 +2470,11 @@ mod tests {
     }
 
     /// Scene previews for checking layout by eye:
-    /// `JUST_VIDEO_SCENE_DIR=/tmp/x cargo test scene_previews -- --ignored`
+    /// `VIDEO_BOX_SCENE_DIR=/tmp/x cargo test scene_previews -- --ignored`
     #[test]
     #[ignore]
     fn scene_previews() {
-        let Ok(dir) = std::env::var("JUST_VIDEO_SCENE_DIR") else {
+        let Ok(dir) = std::env::var("VIDEO_BOX_SCENE_DIR") else {
             return;
         };
         let dir = std::path::PathBuf::from(dir);

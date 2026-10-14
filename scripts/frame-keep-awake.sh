@@ -13,7 +13,7 @@
 #   scripts/frame-keep-awake.sh status
 set -euo pipefail
 cd "$(dirname "$0")/.."
-unit=just-video-keep-awake
+unit=video-box-keep-awake
 case "${1:-4}" in
 stop)
     bash scripts/frame-ssh.sh "systemctl --user stop $unit 2>/dev/null; echo stopped" ;;

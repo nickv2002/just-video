@@ -1302,7 +1302,7 @@ fn thumbnail_worker(
     if let Some(cache) = &cache {
         cache.prune_old();
     }
-    let workers = std::env::var("JUST_VIDEO_THUMB_WORKERS")
+    let workers = std::env::var("VIDEO_BOX_THUMB_WORKERS")
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(THUMB_WORKERS)
@@ -1615,8 +1615,8 @@ impl Library {
                 })
                 .expect("spawn probe dispatcher");
         }
-        // JUST_VIDEO_PROBE_WORKERS: for comparing, e.g. 1 against the default.
-        let workers = std::env::var("JUST_VIDEO_PROBE_WORKERS")
+        // VIDEO_BOX_PROBE_WORKERS: for comparing, e.g. 1 against the default.
+        let workers = std::env::var("VIDEO_BOX_PROBE_WORKERS")
             .ok()
             .and_then(|n| n.parse().ok())
             .unwrap_or(PROBE_WORKERS)

@@ -48,7 +48,7 @@ const ELLIPSIS: &str = "…";
 const BUILD_GAP: f32 = 40.0;
 
 /// Shown top right so installs can be told apart.
-pub const BUILD: &str = env!("JUST_VIDEO_BUILD");
+pub const BUILD: &str = env!("VIDEO_BOX_BUILD");
 
 const BG: Rgb = [0x15, 0x17, 0x1c];
 const ROW_BG: Rgb = [0x1d, 0x21, 0x28];
@@ -1196,7 +1196,7 @@ mod tests {
 
     fn view() -> View {
         View {
-            crumbs: vec!["Just Video".into(), "PC".into(), "media".into()],
+            crumbs: vec!["Video Box".into(), "PC".into(), "media".into()],
             rows: (0..30)
                 .map(|i| Row::new(Icon::Folder, format!("{i}")))
                 .collect(),
@@ -1215,7 +1215,7 @@ mod tests {
             rgba: vec![90; 220 * 124 * 4],
         });
         let mut view = View {
-            crumbs: vec!["Just Video".into(), "PC".into(), "media".into()],
+            crumbs: vec!["Video Box".into(), "PC".into(), "media".into()],
             rows: (0..30)
                 .map(|i| {
                     let mut row =
@@ -1325,7 +1325,7 @@ mod tests {
     fn a_server_row_draws_and_hits_its_settings_button() {
         let mut fonts = Fonts::load().expect("fonts");
         let mut view = View {
-            crumbs: vec!["Just Video".into()],
+            crumbs: vec!["Video Box".into()],
             rows: vec![
                 Row {
                     detail: "smb://user@nas".into(),
@@ -1616,7 +1616,7 @@ mod tests {
     fn long_path_view() -> View {
         View {
             crumbs: [
-                "Just Video",
+                "Video Box",
                 "smb://someone@a-very-long-server-name.example",
                 "Shared Media Archive",
                 "Holiday Recordings From Several Years",
@@ -1713,7 +1713,7 @@ mod tests {
     fn one_enormous_crumb_is_clipped_to_the_row() {
         let mut fonts = Fonts::load().expect("fonts");
         let view = View {
-            crumbs: vec!["Just Video".into(), "x".repeat(300)],
+            crumbs: vec!["Video Box".into(), "x".repeat(300)],
             ..Default::default()
         };
         let spans = crumb_spans(&view, &mut fonts);

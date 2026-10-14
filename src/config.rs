@@ -1,4 +1,4 @@
-//! Saved servers (`~/.config/just-video/servers.json`) and their passwords
+//! Saved servers (`~/.config/video-box/servers.json`) and their passwords
 //! (`credentials.json`, mode 0600 like a mount.cifs credentials file).
 //! SteamOS's game-mode session has no reachable Secret Service, so there is no
 //! encrypted keystore to use; the file is readable only by its owner.
@@ -38,6 +38,26 @@ pub(crate) fn temp_config(name: &str) -> PathBuf {
     dir
 }
 
+/// One-time move of the settings (and log) directories from the name this
+/// app had before it became Video Box: renamed only when the old one exists
+/// and the new one doesn't. Best effort; run before anything reads the config.
+pub fn migrate_old_dirs() {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".config")));
+    let state = home.map(|h| h.join(".local/state"));
+    for base in config.into_iter().chain(state) {
+        migrate_dir(&base.join("just-video"), &base.join("video-box"));
+    }
+}
+
+fn migrate_dir(old: &std::path::Path, new: &std::path::Path) {
+    if old.is_dir() && !new.exists() {
+        let _ = std::fs::rename(old, new);
+    }
+}
+
 pub fn dir() -> anyhow::Result<PathBuf> {
     #[cfg(test)]
     if let Some(dir) = TEST_DIR.with(|d| d.borrow().clone()) {
@@ -47,7 +67,7 @@ pub fn dir() -> anyhow::Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .context("No home directory")?;
-    Ok(base.join("just-video"))
+    Ok(base.join("video-box"))
 }
 
 fn read_json<T: for<'de> Deserialize<'de> + Default>(name: &str) -> anyhow::Result<T> {
@@ -648,6 +668,25 @@ pub fn save_favourite_formats(formats: &[Format]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_dir_is_renamed_only_when_new_is_absent() {
+        let root = std::env::temp_dir().join(format!("vb-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (old, new) = (root.join("just-video"), root.join("video-box"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("servers.json"), "old").unwrap();
+        migrate_dir(&old, &new);
+        assert!(!old.exists());
+        assert_eq!(std::fs::read_to_string(new.join("servers.json")).unwrap(), "old");
+        // A second old directory never overwrites the new one.
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("servers.json"), "stale").unwrap();
+        migrate_dir(&old, &new);
+        assert!(old.exists());
+        assert_eq!(std::fs::read_to_string(new.join("servers.json")).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn stopping_near_the_end_marks_watched() {

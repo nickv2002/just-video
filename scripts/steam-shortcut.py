@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Gives the "Just Video" non-Steam shortcut its library artwork.
+"""Gives the "Video Box" non-Steam shortcut its library artwork.
 
 Run on the headset by install-frame.sh. For every Steam user whose
-shortcuts.vdf has the Just Video entry, copies the art (made by
-`just-video steam-art`) into config/grid/ under the shortcut's app id:
+shortcuts.vdf has the Video Box entry, copies the art (made by
+`video-box steam-art`) into config/grid/ under the shortcut's app id:
 
   portrait.png -> <id>p.png      (library capsule, the "poster")
   capsule.png  -> <id>.png       (wide capsule)
   hero.png     -> <id>_hero.png  (banner on the game page)
   icon.png     -> <id>_icon.png
 
-It also writes ART_DIR/../justvideo.vrmanifest and lists it in SteamVR's
+It also writes ART_DIR/../videobox.vrmanifest and lists it in SteamVR's
 appconfig.json. Steam's own steamapps.vrmanifest entry for a shortcut has only
 binary_path_linux, which SteamVR on the Frame (arm64) skips ("must specify
 binary_path"), so the app has no picture in SteamVR's "Now Playing" panel
@@ -33,7 +33,7 @@ import shutil
 import sys
 import zlib
 
-MARKER = b"Applications/JustVideo/Just Video"
+MARKER = b"Applications/VideoBox/Video Box"
 GRID_NAMES = {
     "portrait.png": "{}p.png",
     "capsule.png": "{}.png",
@@ -45,8 +45,8 @@ GRID_NAMES = {
 def write_vr_manifest(art, app_id):
     """SteamVR app manifest giving app `steam.app.<id>` its picture and launcher."""
     base = os.path.dirname(art)
-    launcher = os.path.join(base, "Just Video")
-    manifest = os.path.join(base, "justvideo.vrmanifest")
+    launcher = os.path.join(base, "Video Box")
+    manifest = os.path.join(base, "videobox.vrmanifest")
     app = {
         "app_key": f"steam.app.{app_id}",
         "launch_type": "binary",
@@ -57,7 +57,7 @@ def write_vr_manifest(art, app_id):
         # Poster only: the dashboard asks /app/image for the portrait, and
         # vrserver answers an empty redirect when image_path_capsule is a file.
         "image_path": os.path.join(art, "portrait.png"),
-        "strings": {"en_us": {"name": "Just Video"}},
+        "strings": {"en_us": {"name": "Video Box"}},
     }
     with open(manifest, "w") as f:
         json.dump({"source": "user", "applications": [app]}, f, indent=2)
@@ -180,10 +180,10 @@ def fallback_id(data):
 
 
 def write_atomic(path, data):
-    backup = path + ".justvideo.bak"
+    backup = path + ".videobox.bak"
     if not os.path.exists(backup):
         shutil.copy2(path, backup)
-    tmp = path + ".justvideo.tmp"
+    tmp = path + ".videobox.tmp"
     with open(tmp, "wb") as f:
         f.write(data)
     os.replace(tmp, path)
@@ -246,7 +246,7 @@ def main():
     if mode == "--icon-ok":
         return 0 if icons_ok else 1
     if not seen:
-        print("Just Video isn't in shortcuts.vdf yet: run the install again to add its art.")
+        print("Video Box isn't in shortcuts.vdf yet: run the install again to add its art.")
     return 0
 
 

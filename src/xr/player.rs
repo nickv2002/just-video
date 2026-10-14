@@ -1741,7 +1741,7 @@ fn spawn_decoder(
     // run ahead. Hardware pictures are copied out of the driver's few buffers
     // (see `Frame::detach`), so a deep queue costs only memory (the renderer's
     // staging buffers); software pictures stay as they are, a few frames.
-    let queue = std::env::var("JUST_VIDEO_QUEUE")
+    let queue = std::env::var("VIDEO_BOX_QUEUE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(if decoder.stats().hw_backend.is_some() {
@@ -1749,10 +1749,10 @@ fn spawn_decoder(
         } else {
             4
         });
-    // JUST_VIDEO_NO_DETACH: hold the driver's buffers as before, to compare.
-    // JUST_VIDEO_DETACH: copy into plain memory without a renderer (bench-seek).
-    let no_detach = std::env::var_os("JUST_VIDEO_NO_DETACH").is_some();
-    let force_detach = std::env::var_os("JUST_VIDEO_DETACH").is_some();
+    // VIDEO_BOX_NO_DETACH: hold the driver's buffers as before, to compare.
+    // VIDEO_BOX_DETACH: copy into plain memory without a renderer (bench-seek).
+    let no_detach = std::env::var_os("VIDEO_BOX_NO_DETACH").is_some();
+    let force_detach = std::env::var_os("VIDEO_BOX_DETACH").is_some();
     let pool = crate::media::FramePool::default();
     let (tx, frames) = mpsc::sync_channel(queue);
     let (control, commands) = mpsc::channel::<SeekRequest>();

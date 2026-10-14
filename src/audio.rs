@@ -80,7 +80,7 @@ impl Output {
                 minreq: u32::MAX,
                 fragsize: u32::MAX,
             };
-            let app = std::ffi::CString::new("Just Video")?;
+            let app = std::ffi::CString::new("Video Box")?;
             let stream_name = std::ffi::CString::new(name.replace('\0', ""))?;
             let mut error = 0;
             let stream = new(

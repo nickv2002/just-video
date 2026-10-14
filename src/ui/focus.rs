@@ -363,7 +363,7 @@ mod tests {
     fn a_server_row_reaches_its_edit_with_right() {
         let mut fonts = Fonts::load().expect("fonts");
         let mut v = View {
-            crumbs: vec!["Just Video".into()],
+            crumbs: vec!["Video Box".into()],
             ..View::default()
         };
         for name in ["NAS", "PC"] {

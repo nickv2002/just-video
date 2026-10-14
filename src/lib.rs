@@ -1,4 +1,4 @@
-//! Just Video: standalone Steam Frame VR player reading directly from SMB shares.
+//! Video Box: standalone Steam Frame VR player reading directly from SMB shares.
 
 pub mod ab_loop;
 #[cfg(feature = "decode")]

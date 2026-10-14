@@ -1,4 +1,4 @@
-//! `just-video bench-seek`: how long a video takes to open and to jump around
+//! `video-box bench-seek`: how long a video takes to open and to jump around
 //! in, through the same open path and decode thread as the headset player,
 //! without OpenXR. Runs on the headset over SMB or on a PC with a local file
 //! (optionally behind a simulated network link).

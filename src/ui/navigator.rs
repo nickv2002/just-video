@@ -330,7 +330,7 @@ impl Navigator {
     }
 
     fn crumbs(&self) -> Vec<String> {
-        let mut crumbs = vec!["Just Video".to_string()];
+        let mut crumbs = vec!["Video Box".to_string()];
         match &self.location {
             Location::Servers => {}
             Location::Settings => crumbs.push("Settings".into()),
@@ -451,7 +451,7 @@ impl Navigator {
         match config::update_preferences(|p| setting.cycle(p)) {
             Ok(prefs) => self.prefs = prefs,
             Err(e) => {
-                // Still applies until Just Video quits.
+                // Still applies until Video Box quits.
                 setting.cycle(&mut self.prefs);
                 self.dialog("Couldn't save the setting", vec![format!("{e:#}")]);
             }
@@ -576,7 +576,7 @@ impl Navigator {
         match config::update_preferences(|p| p.thumbnails = on) {
             Ok(prefs) => self.prefs = prefs,
             Err(e) => {
-                // Still applies until Just Video quits.
+                // Still applies until Video Box quits.
                 self.prefs.thumbnails = on;
                 self.dialog("Couldn't save the setting", vec![format!("{e:#}")]);
             }
@@ -731,7 +731,7 @@ impl Navigator {
                     },
                     Item::Setting(setting) => setting.row(&self.prefs),
                     Item::Exit => Row {
-                        detail: "Close just-video".into(),
+                        detail: "Close Video Box".into(),
                         ..Row::new(Icon::Exit, "Exit")
                     },
                     Item::Share(name) => Row::new(Icon::Share, name),
@@ -2463,7 +2463,7 @@ mod tests {
             &icons[icons.len() - 3..],
             [Icon::Add, Icon::Settings, Icon::Exit]
         );
-        assert_eq!(nav.view().crumbs, vec!["Just Video".to_string()]);
+        assert_eq!(nav.view().crumbs, vec!["Video Box".to_string()]);
         assert!(!nav.take_exit());
         nav.click(Hit::Row(icons.len() - 1));
         assert!(nav.take_exit());
@@ -2476,7 +2476,7 @@ mod tests {
         let mut nav = Navigator::new(Library::start(None));
         let gear = nav.view().rows.len() - 2;
         nav.click(Hit::Row(gear));
-        assert_eq!(nav.view().crumbs, ["Just Video", "Settings"]);
+        assert_eq!(nav.view().crumbs, ["Video Box", "Settings"]);
         assert_eq!(nav.view().rows.len(), settings::ALL.len());
         assert_eq!(nav.view().rows[0].right, "5 s");
         assert_eq!(nav.take_preferences(), None);
@@ -2488,7 +2488,7 @@ mod tests {
         assert_eq!(config::preferences().short_jump, 10, "saved");
 
         assert!(nav.back());
-        assert_eq!(nav.view().crumbs, ["Just Video"]);
+        assert_eq!(nav.view().crumbs, ["Video Box"]);
         assert!(nav.view().rows[gear].outlined, "the way back in");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2783,7 +2783,7 @@ mod tests {
         assert_eq!(form.busy, None, "nothing is sent");
         let error = form.error.as_deref().expect("explained");
         assert!(error.contains("Password field"), "{error}");
-        assert!(!error.contains("JUST_VIDEO"), "{error}");
+        assert!(!error.contains("VIDEO_BOX"), "{error}");
     }
 
     #[test]

@@ -91,8 +91,8 @@ static void describe_vr(const AVCodecParameters *par, JVMediaInfo *info) {
 JVMedia *jv_media_open(const char *name, jv_read_fn read, jv_seek_fn seek, void *opaque,
                        JVMediaInfo *info, char *error, int error_size) {
     memset(info, 0, sizeof(*info));
-    // JUST_VIDEO_FFMPEG_LOG=debug (or verbose, info…) shows more of FFmpeg's log.
-    const char *level = getenv("JUST_VIDEO_FFMPEG_LOG");
+    // VIDEO_BOX_FFMPEG_LOG=debug (or verbose, info…) shows more of FFmpeg's log.
+    const char *level = getenv("VIDEO_BOX_FFMPEG_LOG");
     av_log_set_level(level && !strcmp(level, "debug")     ? AV_LOG_DEBUG
                      : level && !strcmp(level, "verbose") ? AV_LOG_VERBOSE
                      : level && !strcmp(level, "info")    ? AV_LOG_INFO

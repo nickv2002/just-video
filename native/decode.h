@@ -1,5 +1,5 @@
-#ifndef JUST_VIDEO_DECODE_H
-#define JUST_VIDEO_DECODE_H
+#ifndef VIDEO_BOX_DECODE_H
+#define VIDEO_BOX_DECODE_H
 #include <stdint.h>
 typedef struct {
     int32_t frames;

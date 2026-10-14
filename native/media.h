@@ -1,5 +1,5 @@
-#ifndef JUST_VIDEO_MEDIA_H
-#define JUST_VIDEO_MEDIA_H
+#ifndef VIDEO_BOX_MEDIA_H
+#define VIDEO_BOX_MEDIA_H
 #include <stdint.h>
 
 // Player media layer. Input bytes come from Rust through callbacks (SMB or a

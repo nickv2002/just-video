@@ -46,7 +46,7 @@ impl FromStr for SmbUrl {
         if let Some(userinfo) = userinfo {
             ensure!(
                 !userinfo.contains(':'),
-                "Do not put passwords in SMB URLs; use JUST_VIDEO_SMB_PASSWORD or the prompt"
+                "Do not put passwords in SMB URLs; use VIDEO_BOX_SMB_PASSWORD or the prompt"
             );
         }
         let (domain, user) = match userinfo.map(|u| u.split_once(';').unwrap_or(("", u))) {
@@ -618,10 +618,10 @@ pub struct SmbFile {
 }
 
 /// Test hook for what the headset's Wi-Fi does and a desk can't: environment
-/// `JUST_VIDEO_SIM_STALL=every,ms` holds back every `every`-th read for `ms`
+/// `VIDEO_BOX_SIM_STALL=every,ms` holds back every `every`-th read for `ms`
 /// (a flow stalled by loss or a retransmission timeout) and
-/// `JUST_VIDEO_SIM_RESET=n` makes the second connection fail every read from
-/// the `n`-th read on (a connection reset). `JUST_VIDEO_SIM_FLOW=every,ms`
+/// `VIDEO_BOX_SIM_RESET=n` makes the second connection fail every read from
+/// the `n`-th read on (a connection reset). `VIDEO_BOX_SIM_FLOW=every,ms`
 /// holds up the whole connection the `every`-th read went over: it and the
 /// reads that follow on it wait out the `ms` (what a loss or a timeout does to
 /// a TCP flow). Unset: nothing happens.
@@ -649,8 +649,8 @@ impl Sim {
                 ))
             })
         };
-        let (stall, flow) = (pair("JUST_VIDEO_SIM_STALL"), pair("JUST_VIDEO_SIM_FLOW"));
-        let reset_after = std::env::var("JUST_VIDEO_SIM_RESET")
+        let (stall, flow) = (pair("VIDEO_BOX_SIM_STALL"), pair("VIDEO_BOX_SIM_FLOW"));
+        let reset_after = std::env::var("VIDEO_BOX_SIM_RESET")
             .ok()
             .and_then(|v| v.trim().parse().ok());
         (stall.is_some() || flow.is_some() || reset_after.is_some()).then(|| Self {

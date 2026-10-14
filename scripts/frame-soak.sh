@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Soak test of the real player on the headset with nobody wearing it: `play` with
-# JUST_VIDEO_RENDER_UNSEEN (the real frame loop and renderer), an optional timed
-# script of pause / jumps / A-B loop / headset off+on (JUST_VIDEO_SCRIPT, see
+# VIDEO_BOX_RENDER_UNSEEN (the real frame loop and renderer), an optional timed
+# script of pause / jumps / A-B loop / headset off+on (VIDEO_BOX_SCRIPT, see
 # src/xr/script.rs), optional Wi-Fi trouble, and a sampler of RSS, threads and open
 # files. Prints a summary of the `Timing:` log lines (scripts/soak-summary.py).
 #
@@ -21,7 +21,7 @@
 set -euo pipefail
 here=$(dirname "$0")
 url=$1 secs=$2; shift 2
-start=0 script="" binary='$HOME/jv-test/soak/just-video' tag=soak netem=""
+start=0 script="" binary='$HOME/jv-test/soak/video-box' tag=soak netem=""
 while [ $# -gt 0 ]; do
   case $1 in
     --start) start=$2 ;; --script) script=$2 ;; --binary) binary=$2 ;;
@@ -37,12 +37,12 @@ cleanup() {
   if [ -n "$netem" ]; then
     ssh 'sudo -S -p "" tc qdisc del dev wlan0 root <$XDG_RUNTIME_DIR/.jv-sp 2>/dev/null; rm -f $XDG_RUNTIME_DIR/.jv-sp' || true
   fi
-  ssh 'pkill -x just-video 2>/dev/null; wpctl set-mute @DEFAULT_AUDIO_SINK@ 0' || true
+  ssh 'pkill -x video-box 2>/dev/null; wpctl set-mute @DEFAULT_AUDIO_SINK@ 0' || true
 }
 trap cleanup EXIT
 exec 9>/tmp/headset.lock
 flock 9
-ssh 'wpctl set-mute @DEFAULT_AUDIO_SINK@ 1; pkill -x just-video; sleep 1; wpctl get-volume @DEFAULT_AUDIO_SINK@' | grep -q MUTED
+ssh 'wpctl set-mute @DEFAULT_AUDIO_SINK@ 1; pkill -x video-box; sleep 1; wpctl get-volume @DEFAULT_AUDIO_SINK@' | grep -q MUTED
 nas=""
 if [ -n "$netem" ]; then
   host=${url#smb://}; host=${host#*@}; host=${host%%[/:]*}
@@ -75,10 +75,10 @@ IFS=';' read -ra steps <<<"$NETEM"
   done
 ) >/dev/null 2>&1 &
 stepper=$!
-JUST_VIDEO_RENDER_UNSEEN=1 JUST_VIDEO_SCRIPT=$SCRIPT timeout -s INT "$SECS" \
+VIDEO_BOX_RENDER_UNSEEN=1 VIDEO_BOX_SCRIPT=$SCRIPT timeout -s INT "$SECS" \
   "$BIN" play "$URL" --start "$START" --duration 1000000 >/dev/null 2>"$log" &
 sleep 1
-pid=$(pgrep -x just-video | head -1)
+pid=$(pgrep -x video-box | head -1)
 t0=$(date +%s)
 while kill -0 "$pid" 2>/dev/null; do
   rss=$(awk '/VmRSS/{print $2}' /proc/$pid/status 2>/dev/null)

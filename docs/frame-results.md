@@ -12,9 +12,9 @@ Adreno 750 / Mesa Turnip 26.3-devel, system FFmpeg 7.0, glibc 2.39. Full invento
 | V4L2 `iris_decoder` (`/dev/video-dec0`) | H.264, HEVC, VP9 only (no AV1); capture NV12 8-bit only; frame sizes up to 8192×8192. |
 | H.264 / HEVC 8-bit via `*_v4l2m2m` | Works, including 8K, if capture buffers are ≤ 8 (FFmpeg's default 20 → ENOMEM at 8K). |
 | HEVC 10-bit via V4L2 | **Crashes iris firmware** (kernel WARN in `vidc_streamon`, firmware reload); the player never sends 10-bit to it. |
-| Software (FFmpeg 7.0 CPU) | AV1 10-bit: 4K ~88 fps, 8K ~35 fps (dav1d). HEVC 10-bit: 4K 142 fps, 8K 42 fps (via just-video over SMB). |
+| Software (FFmpeg 7.0 CPU) | AV1 10-bit: 4K ~88 fps, 8K ~35 fps (dav1d). HEVC 10-bit: 4K 142 fps, 8K 42 fps (via video-box over SMB). |
 
-## Streaming from SMB with the ARM64 `just-video` (cross-built, no files copied)
+## Streaming from SMB with the ARM64 `video-box` (cross-built, no files copied)
 
 | Source (over SMB, direct link) | Decoder | Speed |
 |---|---|---|
@@ -88,7 +88,7 @@ formats in the Frame's iris driver and firmware. When a SteamOS update lands, ch
 
 Same SteamOS 0.3.0 / kernel 6.18 / `vpu33_4v.mbn`. Test file: FC2-PPV-4808888.mp4, 1080p
 29.97 H.264 High with 2 B-frames, 6 Mb/s, moov first, keyframes every 8.3 s, over SMB on
-the direct link. Measured with the hidden `just-video play-probe` command (`--raw` prints
+the direct link. Measured with the hidden `video-box play-probe` command (`--raw` prints
 the pictures a decoder returns around a seek with a luma signature, so two decoders can be
 compared picture by picture).
 

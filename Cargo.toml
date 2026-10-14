@@ -1,10 +1,10 @@
 [package]
-name = "just-video"
+name = "video-box"
 version = "0.1.0"
 edition = "2024"
 publish = false
 description = "Standalone Steam Frame VR video player reading directly from SMB shares"
-default-run = "just-video"
+default-run = "video-box"
 
 [features]
 default = ["decode"]
@@ -12,7 +12,7 @@ default = ["decode"]
 decode = []
 
 [[bin]]
-name = "just-video"
+name = "video-box"
 path = "src/main.rs"
 required-features = ["decode"]
 

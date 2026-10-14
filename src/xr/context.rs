@@ -37,7 +37,7 @@ impl XrContext {
             available.khr_vulkan_enable2,
             "OpenXR runtime lacks XR_KHR_vulkan_enable2"
         );
-        if std::env::var_os("JUST_VIDEO_LIST_XR_EXTENSIONS").is_some() {
+        if std::env::var_os("VIDEO_BOX_LIST_XR_EXTENSIONS").is_some() {
             let mut names: Vec<String> = available
                 .other
                 .iter()
@@ -90,9 +90,9 @@ impl XrContext {
         }
         let xr = entry.create_instance(
             &xr::ApplicationInfo {
-                application_name: "Just Video",
+                application_name: "Video Box",
                 application_version: 1,
-                engine_name: "just-video",
+                engine_name: "video-box",
                 engine_version: 1,
                 api_version: xr::Version::new(1, 0, 0),
             },
@@ -118,7 +118,7 @@ impl XrContext {
 
         let vk_entry = unsafe { ash::Entry::load() }.context("Load Vulkan")?;
         let app_info = vk::ApplicationInfo::default()
-            .application_name(c"Just Video")
+            .application_name(c"Video Box")
             .api_version(vk_target);
         let instance_info = vk::InstanceCreateInfo::default().application_info(&app_info);
         let get_instance_proc_addr: xr::sys::platform::VkGetInstanceProcAddr =
