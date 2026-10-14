@@ -4,7 +4,7 @@ Most of the code is as well.
 AI contributions are welcome (as to not be a hypocrite).  
 ```
 
-# Just Video
+# Video Box
 
 A VR video player for Steam Frame that streams straight from SMB shares. (You make butter.)
 
@@ -27,12 +27,19 @@ bash scripts/build-frame.sh
    ssh-keygen -t ed25519 -f ~/.ssh/steam_frame_ed25519
    ssh-copy-id -i ~/.ssh/steam_frame_ed25519 steamos@frame.local
    ```
-3. Install (adds **Just Video** to the Steam library):
+3. Install (adds **Video Box** to the Steam library):
    ```sh
    bash scripts/install-frame.sh   # FRAME_HOST=<ip> if frame.local doesn't resolve
    ```
 
 ## Run
 
-Start **Just Video** from the Steam library on the Frame, choose **Add server**
+Start **Video Box** from the Steam library on the Frame, choose **Add server**
 and enter your SMB server's address and login.
+
+## Origin
+
+Video Box is a fork of [Just Video](https://github.com/kumorig/just-video) by
+kumorig and contributors, which did the original work: the SMB streaming,
+decoding and OpenXR player this builds on. It stays MIT-licensed; see `LICENSE`.
+Settings from the old name are moved to the new locations on first start.
