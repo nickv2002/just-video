@@ -4,7 +4,7 @@
 //! Holding select on an entry selects it: the header then offers Delete,
 //! Move and (for one entry) Rename or Start over in place of the
 //! breadcrumbs, and other entries can be ticked. Holding select on a server
-//! reveals its Settings and Remove buttons. Files can only be changed on
+//! reveals its Edit and Delete buttons. Files can only be changed on
 //! servers that allow it in their settings ("Allow changing files").
 //!
 //! The server list also leads to the Settings screen ([`super::settings`]).
@@ -166,7 +166,8 @@ enum Purpose {
     /// Editing the server with this URL.
     EditServer(String),
     Rename(usize),
-    RemoveServer(usize),
+    /// Deleting the server at this index; `from_form` when asked in its Edit form.
+    DeleteServer { index: usize, from_form: bool },
     /// Deleting these entries.
     Delete(Vec<usize>),
     Info,
@@ -180,7 +181,7 @@ pub struct Navigator {
     purpose: Option<Purpose>,
     /// Entries held and ticked, to move, delete, rename or start over
     /// (the header shows the tools). On the server list, the one server
-    /// showing its Settings and Remove buttons.
+    /// showing its Edit and Delete buttons.
     selecting: Option<HashSet<usize>>,
     /// Sources survive navigation until a destination is chosen or cancelled.
     moving: Option<MoveSelection>,
@@ -719,11 +720,11 @@ impl Navigator {
                 let mut row = match item {
                     Item::Server(s) => Row {
                         detail: s.url.clone(),
-                        // Settings is always there to find; holding adds Remove.
+                        // Edit is always there to find; holding adds Delete.
                         actions: if selecting.is_some_and(|sel| sel.contains(&i)) {
-                            vec![Action::Settings, Action::Remove]
+                            vec![Action::Edit, Action::Delete]
                         } else {
-                            vec![Action::Settings]
+                            vec![Action::Edit]
                         },
                         ..Row::new(Icon::Server, &s.name)
                     },
@@ -1193,8 +1194,8 @@ impl Navigator {
             Hit::DialogButton(i) => self.click_dialog(i),
             Hit::Crumb(i) => self.go_to_crumb(i),
             Hit::Tool(k) => self.click_tool(k),
-            Hit::RowAction(i, Action::Settings) => self.start_edit_server(i),
-            Hit::RowAction(i, Action::Remove) => self.confirm_remove_server(i),
+            Hit::RowAction(i, Action::Edit) => self.start_edit_server(i),
+            Hit::RowAction(i, Action::Delete) => self.confirm_delete_server(i, false),
             Hit::Row(i) => self.select(i),
             Hit::ScrollBar | Hit::Nothing => {}
         }
@@ -1395,7 +1396,7 @@ impl Navigator {
     }
 
     /// A long press on a row: edit mode with that entry selected (a server
-    /// shows its Settings and Remove buttons).
+    /// shows its Edit and Delete buttons).
     pub fn long_press(&mut self, index: usize) {
         if self.moving.is_some() || !self.pending_changes.is_empty() {
             return;
@@ -1407,7 +1408,7 @@ impl Navigator {
             Some(item) if item.is_entry() => {
                 if !self.editing() {
                     self.view.notice = Some(
-                        "To change files, allow it in this server's settings (hold the server, then Settings)."
+                        "To change files, allow it in this server's settings (tap Edit on the server)."
                             .into(),
                     );
                     self.dirty = true;
@@ -1671,6 +1672,9 @@ impl Navigator {
             submit,
         );
         form.toggle = Some(("Allow changing files".into(), writable));
+        if existing.is_some() {
+            form.delete = Some("Delete".into());
+        }
         self.view.form = Some(form);
         self.purpose = Some(match existing {
             Some(s) => Purpose::EditServer(s.url),
@@ -1705,17 +1709,20 @@ impl Navigator {
         self.dirty = true;
     }
 
-    fn confirm_remove_server(&mut self, index: usize) {
+    fn confirm_delete_server(&mut self, index: usize, from_form: bool) {
         let Some(Item::Server(s)) = self.items.get(index) else {
             return;
         };
+        self.view.form = None;
         self.view.dialog = Some(Dialog {
-            title: format!("Remove {}?", s.name),
-            body: vec!["Removes this server and its saved password from Just Video. Nothing on the server changes.".into()],
-            buttons: vec!["Cancel".into(), "Remove".into()],
+            title: format!("Delete {}?", s.name),
+            body: vec![
+                "Forgets this server and its saved password. Resume points and picture settings are kept, and nothing on the server changes.".into(),
+            ],
+            buttons: vec!["Cancel".into(), "Delete".into()],
             danger: true,
         });
-        self.purpose = Some(Purpose::RemoveServer(index));
+        self.purpose = Some(Purpose::DeleteServer { index, from_form });
         self.dirty = true;
     }
 
@@ -1729,15 +1736,23 @@ impl Navigator {
         self.dirty = true;
         let purpose = self.purpose.take();
         if !confirmed {
+            // Cancelling a delete asked from the Edit form goes back to it.
+            if let Some(Purpose::DeleteServer {
+                index,
+                from_form: true,
+            }) = purpose
+            {
+                self.start_edit_server(index);
+            }
             return;
         }
         match purpose {
-            Some(Purpose::RemoveServer(index)) => {
+            Some(Purpose::DeleteServer { index, .. }) => {
                 if let Some(Item::Server(s)) = self.items.get(index) {
                     let url = s.url.clone();
                     match config::remove_server(&url) {
                         Ok(_) => self.show_servers(),
-                        Err(e) => self.dialog("Couldn't remove the server", vec![format!("{e:#}")]),
+                        Err(e) => self.dialog("Couldn't delete the server", vec![format!("{e:#}")]),
                     }
                 }
             }
@@ -1793,6 +1808,18 @@ impl Navigator {
                     self.purpose = None;
                 }
                 Some(Key::Submit) => self.submit_form(),
+                Some(Key::Delete) => {
+                    if let Some(Purpose::EditServer(url)) = &self.purpose {
+                        let url = url.clone();
+                        if let Some(i) = self
+                            .items
+                            .iter()
+                            .position(|it| matches!(it, Item::Server(s) if s.url == url))
+                        {
+                            self.confirm_delete_server(i, true);
+                        }
+                    }
+                }
                 _ => {}
             },
             form::Hit::Nothing => {}
@@ -2582,31 +2609,31 @@ mod tests {
             Item::AddServer,
         ];
         nav.rebuild_rows();
-        // Every server shows Settings; Remove waits for the hold.
+        // Every server shows Edit; Delete waits for the hold.
         for i in 0..2 {
-            assert_eq!(nav.view().rows[i].actions, vec![Action::Settings]);
+            assert_eq!(nav.view().rows[i].actions, vec![Action::Edit]);
         }
         assert!(nav.view().rows[2].actions.is_empty(), "Add server");
         nav.long_press(1);
         assert_eq!(
             nav.view().rows[1].actions,
-            vec![Action::Settings, Action::Remove]
+            vec![Action::Edit, Action::Delete]
         );
-        assert_eq!(nav.view().rows[0].actions, vec![Action::Settings]);
+        assert_eq!(nav.view().rows[0].actions, vec![Action::Edit]);
         assert!(nav.view().rows.iter().all(|r| r.checked.is_none()));
         assert_eq!(nav.view().tools.len(), 1, "cancel");
-        nav.click(Hit::RowAction(1, Action::Settings));
+        nav.click(Hit::RowAction(1, Action::Edit));
         assert!(matches!(nav.purpose, Some(Purpose::EditServer(ref u)) if u == "smb://u@pc"));
         nav.back();
         nav.long_press(1);
         assert!(nav.back(), "B closes the buttons");
-        assert_eq!(nav.view().rows[1].actions, vec![Action::Settings]);
+        assert_eq!(nav.view().rows[1].actions, vec![Action::Edit]);
         nav.long_press(2);
         assert!(nav.selecting.is_none(), "nothing to hold on Add server");
     }
 
     #[test]
-    fn a_server_row_always_offers_its_settings() {
+    fn a_server_row_always_offers_edit() {
         let mut nav = Navigator::new(Library::start(None));
         nav.items = vec![
             Item::Server(Server {
@@ -2622,14 +2649,14 @@ mod tests {
         ];
         nav.rebuild_rows();
         assert_eq!(nav.selecting, None);
-        nav.click(Hit::RowAction(0, Action::Settings));
+        nav.click(Hit::RowAction(0, Action::Edit));
         let form = nav.view().form.as_ref().expect("edit form");
         assert_eq!(form.title, "Edit NAS");
         assert!(matches!(nav.purpose, Some(Purpose::EditServer(ref u)) if u == "smb://u@nas"));
         nav.back();
         assert!(nav.view().form.is_none());
         // A tap on the row itself still opens the server, not the form.
-        assert_eq!(nav.view().rows[1].actions, vec![Action::Settings]);
+        assert_eq!(nav.view().rows[1].actions, vec![Action::Edit]);
     }
 
     #[test]
@@ -2644,16 +2671,16 @@ mod tests {
             Item::AddServer,
         ];
         nav.rebuild_rows();
-        assert_eq!(nav.view().rows[0].actions, vec![Action::Settings]);
+        assert_eq!(nav.view().rows[0].actions, vec![Action::Edit]);
         nav.long_press(0);
         let row = &nav.view().rows[0];
-        assert_eq!(row.actions, vec![Action::Settings, Action::Remove]);
+        assert_eq!(row.actions, vec![Action::Edit, Action::Delete]);
 
-        nav.click(Hit::RowAction(0, Action::Remove));
+        nav.click(Hit::RowAction(0, Action::Delete));
         assert!(nav.dialog_open(), "removing asks first");
         assert!(nav.back());
 
-        nav.click(Hit::RowAction(0, Action::Settings));
+        nav.click(Hit::RowAction(0, Action::Edit));
         let form = nav.view().form.as_ref().expect("edit form");
         assert_eq!(form.title, "Edit NAS");
         let values: Vec<&str> = (0..4).map(|i| form.value(i)).collect();
@@ -2665,6 +2692,62 @@ mod tests {
         assert!(
             matches!(&nav.purpose, Some(Purpose::EditServer(url)) if url == "smb://WORK;bob@nas:4455")
         );
+    }
+
+    #[test]
+    fn deleting_a_server_from_its_edit_form_asks_first() {
+        let dir = config::temp_config("nav-delete");
+        let pc = Server {
+            name: "PC".into(),
+            url: "smb://alice@pc".into(),
+            writable: false,
+        };
+        let nas = Server {
+            name: "NAS".into(),
+            url: "smb://bob@nas".into(),
+            writable: false,
+        };
+        config::save_server(pc.clone(), "a").unwrap();
+        config::save_server(nas.clone(), "b").unwrap();
+        let mut nav = Navigator::new(Library::start(None));
+
+        // Add server has no Delete; an existing server's form does.
+        nav.start_server_form(None);
+        assert_eq!(nav.view().form.as_ref().unwrap().delete, None);
+        nav.back();
+        nav.click(Hit::RowAction(1, Action::Edit));
+        assert_eq!(
+            nav.view().form.as_ref().unwrap().delete.as_deref(),
+            Some("Delete")
+        );
+
+        // Delete asks; Cancel returns to the form and keeps the server.
+        nav.click(Hit::Form(form::Hit::Key(Key::Delete)));
+        let dialog = nav.view().dialog.as_ref().expect("confirmation");
+        assert_eq!(dialog.title, "Delete NAS?");
+        assert_eq!(dialog.buttons, ["Cancel", "Delete"]);
+        assert!(dialog.danger);
+        assert_eq!(config::servers().unwrap().len(), 2, "nothing yet");
+        nav.click(Hit::DialogButton(0));
+        assert_eq!(nav.view().form.as_ref().unwrap().title, "Edit NAS");
+        assert_eq!(config::servers().unwrap().len(), 2);
+
+        // Confirming deletes the server and its password.
+        nav.click(Hit::Form(form::Hit::Key(Key::Delete)));
+        nav.click(Hit::DialogButton(1));
+        assert!(nav.view().form.is_none() && !nav.dialog_open());
+        assert_eq!(config::servers().unwrap(), vec![pc]);
+        assert_eq!(config::password(&nas.url).unwrap(), None);
+        assert_eq!(nav.view().rows.iter().filter(|r| r.icon == Icon::Server).count(), 1);
+
+        // Holding a row offers the same Delete, with the same confirmation.
+        nav.long_press(0);
+        nav.click(Hit::RowAction(0, Action::Delete));
+        assert_eq!(nav.view().dialog.as_ref().unwrap().title, "Delete PC?");
+        nav.click(Hit::DialogButton(0));
+        assert!(nav.view().form.is_none());
+        assert_eq!(config::servers().unwrap().len(), 1, "cancel keeps it");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2683,7 +2766,7 @@ mod tests {
         config::save_server(pc.clone(), "a").unwrap();
         config::save_server(nas.clone(), "b").unwrap();
         let mut nav = Navigator::new(Library::start(None));
-        nav.click(Hit::RowAction(0, Action::Settings));
+        nav.click(Hit::RowAction(0, Action::Edit));
         let form = nav.view.form.as_mut().expect("edit form");
         form.fields[0].value = "nas".into();
         form.fields[1].value = "bob".into();

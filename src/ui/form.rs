@@ -41,6 +41,8 @@ pub struct Form {
     pub submit: String,
     /// A checkbox beside the last field: its label, and whether it's ticked.
     pub toggle: Option<(String, bool)>,
+    /// A danger button beside Cancel (Delete, in a saved server's form).
+    pub delete: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +57,8 @@ pub enum Key {
     Space,
     Cancel,
     Submit,
+    /// The form's danger button.
+    Delete,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +83,7 @@ impl Form {
             busy: None,
             submit: submit.into(),
             toggle: None,
+            delete: None,
         }
     }
 
@@ -139,7 +144,7 @@ impl Form {
                     Layer::Symbols
                 };
             }
-            Key::Cancel | Key::Submit => return Some(key),
+            Key::Cancel | Key::Submit | Key::Delete => return Some(key),
         }
         None
     }
@@ -220,7 +225,12 @@ fn keys(form: &Form, panel_width: f32) -> Vec<(Key, Rect)> {
     // Bottom row: cancel, space, submit.
     let y = top + 4.0 * (KEY_H + KEY_GAP);
     out.push((Key::Cancel, (X0, y, 300.0, KEY_H)));
-    out.push((Key::Space, (X0 + 310.0, y, width - 620.0, KEY_H)));
+    let mut space_x = X0 + 310.0;
+    if form.delete.is_some() {
+        out.push((Key::Delete, (space_x, y, 300.0, KEY_H)));
+        space_x += 310.0;
+    }
+    out.push((Key::Space, (space_x, y, X0 + width - 310.0 - space_x, KEY_H)));
     out.push((Key::Submit, (X0 + width - 300.0, y, 300.0, KEY_H)));
     out
 }
@@ -326,7 +336,8 @@ fn key_label(key: Key, form: &Form) -> String {
                 "#+=".into()
             }
         }
-        Key::Backspace => "Delete".into(),
+        Key::Backspace => "Back".into(),
+        Key::Delete => form.delete.clone().unwrap_or_default(),
         // Drawn as triangles.
         Key::Left | Key::Right => String::new(),
         Key::Space => "space".into(),
@@ -415,6 +426,13 @@ pub fn render(canvas: &mut Canvas, fonts: &mut Fonts, form: &Form, hover: Hit) {
                     [0x6b, 0xa0, 0xff]
                 } else {
                     ACCENT
+                }
+            }
+            Key::Delete => {
+                if hovered {
+                    [0xff, 0x45, 0x3a]
+                } else {
+                    [0x7a, 0x25, 0x20]
                 }
             }
             _ if hovered => KEY_HOVER,

@@ -1758,14 +1758,14 @@ fn main() -> anyhow::Result<()> {
                     Row {
                         detail: "smb://user@192.168.1.10".into(),
                         actions: vec![
-                            just_video::ui::browser::Action::Settings,
-                            just_video::ui::browser::Action::Remove,
+                            just_video::ui::browser::Action::Edit,
+                            just_video::ui::browser::Action::Delete,
                         ],
                         ..Row::new(Icon::Server, "NAS")
                     },
                     Row {
                         detail: "smb://user@10.0.0.2".into(),
-                        actions: vec![just_video::ui::browser::Action::Settings],
+                        actions: vec![just_video::ui::browser::Action::Edit],
                         ..Row::new(Icon::Server, "PC")
                     },
                     Row {
@@ -1846,6 +1846,7 @@ fn main() -> anyhow::Result<()> {
             ));
             if let Some(f) = &mut editing_server.form {
                 f.toggle = Some(("Allow changing files".into(), true));
+                f.delete = Some("Delete".into());
             }
             just_video::ui::save_png(
                 &render(&editing_server, &mut fonts, None, false),
@@ -1854,6 +1855,19 @@ fn main() -> anyhow::Result<()> {
             just_video::ui::save_png(
                 &render(&servers, &mut fonts, None, false),
                 &dir.join("servers.png"),
+            )?;
+            let mut deleting = servers.clone();
+            deleting.dialog = Some(Dialog {
+                title: "Delete NAS?".into(),
+                body: vec![
+                    "Forgets this server and its saved password. Resume points and picture settings are kept, and nothing on the server changes.".into(),
+                ],
+                buttons: vec!["Cancel".into(), "Delete".into()],
+                danger: true,
+            });
+            just_video::ui::save_png(
+                &render(&deleting, &mut fonts, Some((800.0, 790.0)), true),
+                &dir.join("server-delete.png"),
             )?;
             let mut dialog = folder.clone();
             dialog.dialog = Some(Dialog {

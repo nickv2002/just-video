@@ -280,7 +280,7 @@ mod tests {
         for i in 0..rows {
             let mut row = Row::new(Icon::Folder, format!("Folder {i}"));
             if i == 1 {
-                row.actions = vec![Action::Settings, Action::Remove];
+                row.actions = vec![Action::Edit, Action::Delete];
             }
             v.rows.push(row);
         }
@@ -302,10 +302,10 @@ mod tests {
         let f = step(&v, &mut fonts, f, Dir::Down);
         assert_eq!(f.hit, Hit::Row(1));
         let f = step(&v, &mut fonts, f, Dir::Right);
-        assert_eq!(f.hit, Hit::RowAction(1, Action::Settings));
+        assert_eq!(f.hit, Hit::RowAction(1, Action::Edit));
         round_trips(&v, &mut fonts, &f);
         let f = step(&v, &mut fonts, f, Dir::Right);
-        assert_eq!(f.hit, Hit::RowAction(1, Action::Remove));
+        assert_eq!(f.hit, Hit::RowAction(1, Action::Delete));
         round_trips(&v, &mut fonts, &f);
         assert_eq!(step(&v, &mut fonts, f, Dir::Right), f, "edge");
         // Down to a row without buttons: the row itself.
@@ -338,7 +338,7 @@ mod tests {
         let at = at_hit(&v, &mut fonts, Hit::Row(3), p(Hit::Row(3))).unwrap();
         assert_eq!(at.hit, Hit::Row(3));
         assert_eq!(step(&v, &mut fonts, at, Dir::Down).hit, Hit::Row(4));
-        let action = Hit::RowAction(1, Action::Remove);
+        let action = Hit::RowAction(1, Action::Delete);
         let f = at_hit(&v, &mut fonts, action, p(action)).unwrap();
         assert_eq!(f.hit, action);
         round_trips(&v, &mut fonts, &f);
@@ -360,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn a_server_row_reaches_its_settings_with_right() {
+    fn a_server_row_reaches_its_edit_with_right() {
         let mut fonts = Fonts::load().expect("fonts");
         let mut v = View {
             crumbs: vec!["Just Video".into()],
@@ -368,18 +368,18 @@ mod tests {
         };
         for name in ["NAS", "PC"] {
             let mut row = Row::new(Icon::Server, name);
-            row.actions = vec![Action::Settings];
+            row.actions = vec![Action::Edit];
             v.rows.push(row);
         }
         let first = initial(&v, &mut fonts).unwrap();
         assert_eq!(opens_on_right(&v, &first), None, "right goes to the button");
         let button = step(&v, &mut fonts, first, Dir::Right);
-        assert_eq!(button.hit, Hit::RowAction(0, Action::Settings));
+        assert_eq!(button.hit, Hit::RowAction(0, Action::Edit));
         round_trips(&v, &mut fonts, &button);
         assert_eq!(step(&v, &mut fonts, button, Dir::Right), button, "edge");
         assert_eq!(step(&v, &mut fonts, button, Dir::Left).hit, Hit::Row(0));
         let down = step(&v, &mut fonts, button, Dir::Down);
-        assert_eq!(down.hit, Hit::RowAction(1, Action::Settings), "stays on the button column");
+        assert_eq!(down.hit, Hit::RowAction(1, Action::Edit), "stays on the button column");
     }
 
     #[test]
@@ -449,6 +449,35 @@ mod tests {
         round_trips(&v, &mut fonts, &f);
         v.dialog.as_mut().unwrap().danger = false;
         assert_eq!(initial(&v, &mut fonts).unwrap().hit, Hit::DialogButton(1));
+    }
+
+    #[test]
+    fn the_dpad_reaches_delete_in_a_saved_servers_form() {
+        use form::{Field, Form, Key};
+        let mut fonts = Fonts::load().expect("fonts");
+        let mut v = view(5);
+        let mut f = Form::new(
+            "Edit NAS",
+            vec![Field {
+                label: "Name".into(),
+                value: "abc".into(),
+                secret: false,
+                placeholder: String::new(),
+            }],
+            "Save",
+        );
+        f.delete = Some("Delete".into());
+        v.form = Some(f);
+        let mut at = initial(&v, &mut fonts).unwrap();
+        for _ in 0..5 {
+            at = step(&v, &mut fonts, at, Dir::Down);
+        }
+        assert_eq!(at.hit, Hit::Form(form::Hit::Key(Key::Cancel)));
+        let delete = step(&v, &mut fonts, at, Dir::Right);
+        assert_eq!(delete.hit, Hit::Form(form::Hit::Key(Key::Delete)));
+        round_trips(&v, &mut fonts, &delete);
+        let space = step(&v, &mut fonts, delete, Dir::Right);
+        assert_eq!(space.hit, Hit::Form(form::Hit::Key(Key::Space)));
     }
 
     #[test]

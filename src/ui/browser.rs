@@ -30,7 +30,6 @@ const CRUMB_SIZE: f32 = 40.0;
 const CRUMB_SEP: &str = "  ›  ";
 /// Row actions, from the right edge of a row.
 const ACTION_W: f32 = 150.0;
-const ICON_ACTION_W: f32 = 84.0;
 /// The scrollbar's grab zone at the right edge of the list.
 const SCROLL_W: f32 = 64.0;
 /// Header tool buttons (e.g. "Cancel", "Delete 3").
@@ -104,29 +103,20 @@ impl Icon {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     /// A server's address, login and name.
-    Settings,
-    /// Remove a saved server.
-    Remove,
+    Edit,
+    /// Delete a saved server.
+    Delete,
 }
 
 impl Action {
-    /// Remove is a trash can; the rest are labelled.
-    fn is_icon(self) -> bool {
-        matches!(self, Action::Remove)
-    }
-
     fn width(self) -> f32 {
-        if self.is_icon() {
-            ICON_ACTION_W
-        } else {
-            ACTION_W
-        }
+        ACTION_W
     }
 
     fn label(self) -> &'static str {
         match self {
-            Action::Settings => "Settings",
-            Action::Remove => "Remove",
+            Action::Edit => "Edit",
+            Action::Delete => "Delete",
         }
     }
 }
@@ -717,16 +707,6 @@ fn verdict_color(verdict: Option<Verdict>) -> Rgb {
     }
 }
 
-/// A trash can: lid with handle, and a body with three slots.
-fn draw_trash(canvas: &mut Canvas, cx: f32, cy: f32, color: Rgb) {
-    canvas.rect(cx - 6.0, cy - 21.0, 12.0, 5.0, 2.0, color);
-    canvas.rect(cx - 17.0, cy - 16.0, 34.0, 5.0, 2.0, color);
-    canvas.rect(cx - 13.0, cy - 8.0, 26.0, 29.0, 4.0, color);
-    for dx in [-6.0, 0.0, 6.0] {
-        canvas.rect(cx + dx - 1.5, cy - 3.0, 3.0, 19.0, 1.5, [0x6a, 0x1d, 0x19]);
-    }
-}
-
 /// A checkbox, `fill` when ticked, cut out of `background` when not.
 pub(super) fn draw_checkbox(
     canvas: &mut Canvas,
@@ -888,7 +868,7 @@ pub fn render_into(
             let mut right_edge = rx + rw - 24.0;
             for (k, action) in row.actions.iter().enumerate() {
                 let (ax, ay, aw, ah) = action_rect(view, i, k);
-                let color = if *action == Action::Remove {
+                let color = if *action == Action::Delete {
                     RED
                 } else {
                     ACCENT
@@ -900,14 +880,10 @@ pub fn render_into(
                     [color[0] / 3, color[1] / 3, color[2] / 3]
                 };
                 canvas.rect(ax, ay, aw, ah, 12.0, fill);
-                if action.is_icon() {
-                    draw_trash(&mut canvas, ax + aw / 2.0, ay + ah / 2.0, TEXT);
-                } else {
-                    let label = action.label();
-                    let lw = fonts.measure(label, 30.0);
-                    let lx = ax + (aw - lw) / 2.0;
-                    fonts.draw(&mut canvas, label, lx, ay + ah / 2.0 + 11.0, 30.0, TEXT, aw);
-                }
+                let label = action.label();
+                let lw = fonts.measure(label, 30.0);
+                let lx = ax + (aw - lw) / 2.0;
+                fonts.draw(&mut canvas, label, lx, ay + ah / 2.0 + 11.0, 30.0, TEXT, aw);
                 if k == 0 {
                     right_edge = ax - 16.0;
                 }
@@ -1246,7 +1222,7 @@ mod tests {
                         Row::new(Icon::Video(None), format!("Some video file name {i}.mp4"));
                     row.detail = "VR180 3D · 6144x3072 HEVC · 12 GB".into();
                     row.right = "1:23:45".into();
-                    row.actions = vec![Action::Settings, Action::Remove];
+                    row.actions = vec![Action::Edit, Action::Delete];
                     row.thumbnail = Some(thumb.clone());
                     row
                 })
@@ -1353,7 +1329,7 @@ mod tests {
             rows: vec![
                 Row {
                     detail: "smb://user@nas".into(),
-                    actions: vec![Action::Settings],
+                    actions: vec![Action::Edit],
                     ..Row::new(Icon::Server, "NAS")
                 },
                 Row::new(Icon::Add, "Add server"),
@@ -1367,7 +1343,7 @@ mod tests {
         let (cx, cy) = (ax + aw / 2.0, ay + ah / 2.0);
         assert_eq!(
             hit(&view, &mut fonts, cx, cy),
-            Hit::RowAction(0, Action::Settings)
+            Hit::RowAction(0, Action::Edit)
         );
         assert_eq!(hit(&view, &mut fonts, rx + 40.0, cy), Hit::Row(0));
         // The button is painted: its corner differs from the bare row.
@@ -1386,8 +1362,8 @@ mod tests {
     fn row_actions_and_tools() {
         let mut view = view();
         let mut fonts = Fonts::load().expect("fonts");
-        view.rows[2].actions = vec![Action::Settings, Action::Remove];
-        for (k, action) in [Action::Settings, Action::Remove].into_iter().enumerate() {
+        view.rows[2].actions = vec![Action::Edit, Action::Delete];
+        for (k, action) in [Action::Edit, Action::Delete].into_iter().enumerate() {
             let (ax, ay, aw, ah) = action_rect(&view, 2, k);
             assert_eq!(
                 hit(&view, &mut fonts, ax + aw / 2.0, ay + ah / 2.0),
