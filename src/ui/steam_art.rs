@@ -1,6 +1,6 @@
 //! Steam library artwork (capsules, hero, icon) for the non-Steam shortcut.
 //! Rendered with the UI canvas so it can be regenerated without image tools:
-//! `just-video steam-art assets/steam`.
+//! `video-box steam-art assets/steam`.
 
 use super::canvas::{Canvas, Fonts, Rgb};
 
@@ -26,9 +26,8 @@ pub fn render(name: &str, width: u32, height: u32, fonts: &mut Fonts) -> Canvas 
     match name {
         "portrait.png" => {
             background(&mut c, (w / 2.0, h * 0.4), h * 0.45);
-            perforations(&mut c, 34.0);
-            emblem(&mut c, w / 2.0, h * 0.4, 150.0);
-            centered(&mut c, fonts, "Just Video", h * 0.72, 92.0, TEXT);
+            emblem(&mut c, w / 2.0, h * 0.4, 170.0);
+            centered(&mut c, fonts, "Video Box", h * 0.72, 92.0, TEXT);
             centered(
                 &mut c,
                 fonts,
@@ -42,7 +41,7 @@ pub fn render(name: &str, width: u32, height: u32, fonts: &mut Fonts) -> Canvas 
             background(&mut c, (w * 0.25, h / 2.0), h * 0.7);
             emblem(&mut c, w * 0.25, h / 2.0, 120.0);
             let x = w * 0.46;
-            fonts.draw(&mut c, "Just Video", x, h / 2.0 + 20.0, 88.0, TEXT, w);
+            fonts.draw(&mut c, "Video Box", x, h / 2.0 + 20.0, 88.0, TEXT, w);
             fonts.draw(
                 &mut c,
                 "VR video player",
@@ -56,7 +55,6 @@ pub fn render(name: &str, width: u32, height: u32, fonts: &mut Fonts) -> Canvas 
         // Steam draws the title over the hero, so it carries no text.
         "hero.png" => {
             background(&mut c, (w * 0.72, h / 2.0), h * 0.8);
-            perforations(&mut c, 30.0);
             emblem(&mut c, w * 0.72, h / 2.0, 170.0);
         }
         _ => {
@@ -85,36 +83,54 @@ fn background(c: &mut Canvas, glow: (f32, f32), radius: f32) {
     }
 }
 
-/// Film-strip holes along the top and bottom edges.
-fn perforations(c: &mut Canvas, size: f32) {
-    let (w, h) = (c.width as f32, c.height as f32);
-    let hole = [0x05, 0x06, 0x08];
-    let step = size * 1.8;
-    let count = (w / step).floor();
-    let x0 = (w - count * step) / 2.0 + (step - size) / 2.0;
-    for i in 0..count as usize {
-        let x = x0 + i as f32 * step;
-        c.rect(x, size * 0.5, size, size * 0.7, size * 0.15, hole);
-        c.rect(x, h - size * 1.2, size, size * 0.7, size * 0.15, hole);
-    }
-}
-
-/// Accent disc with a play triangle.
+/// An isometric box with a play triangle on its front-left face.
 fn emblem(c: &mut Canvas, cx: f32, cy: f32, r: f32) {
-    c.circle(cx, cy + r * 0.04, r * 1.02, [0x08, 0x0a, 0x0e]);
-    c.circle(cx, cy, r, ACCENT);
-    // Shifted right so the triangle's centroid sits on the disc's centre.
-    let s = r * 0.48;
-    let x = cx + s * 0.25;
-    triangle(
+    let r = r * 1.15;
+    let k = 0.866_025_4 * r;
+    let at = |dx: f32, dy: f32| (cx + dx, cy + dy);
+    let (top, ur, lr) = (at(0.0, -r), at(k, -r / 2.0), at(k, r / 2.0));
+    let (bottom, ll, ul, mid) = (at(0.0, r), at(-k, r / 2.0), at(-k, -r / 2.0), at(0.0, 0.0));
+    // Soft shadow under the box.
+    let (sx, sy) = (0.0, r * 0.06);
+    let shifted: Vec<_> = [top, ur, lr, bottom, ll, ul]
+        .iter()
+        .map(|p| (p.0 + sx, p.1 + sy))
+        .collect();
+    polygon(c, &shifted, [0x05, 0x07, 0x0b]);
+    polygon(c, &[top, ur, mid, ul], [0xb9, 0xd3, 0xff]);
+    polygon(c, &[ul, mid, bottom, ll], ACCENT);
+    polygon(c, &[mid, ur, lr, bottom], [0x2c, 0x56, 0xa8]);
+    // Edges between the faces.
+    let edge = [0x0c, 0x16, 0x2a];
+    for (a, b) in [(ul, mid), (mid, ur), (mid, bottom)] {
+        line(c, a, b, r * 0.025, edge);
+    }
+    // An upright play triangle (centroid on the left face's centre).
+    let (fx, fy) = ((ul.0 + bottom.0) / 2.0, (ul.1 + bottom.1) / 2.0);
+    let t = r * 0.26;
+    polygon(
         c,
-        [(x - s * 0.75, cy - s), (x - s * 0.75, cy + s), (x + s, cy)],
+        &[(fx - t * 0.55, fy - t), (fx - t * 0.55, fy + t), (fx + t * 1.1, fy)],
         TEXT,
     );
 }
 
-/// Filled triangle, anti-aliased by 4×4 supersampling.
-fn triangle(c: &mut Canvas, p: [(f32, f32); 3], color: Rgb) {
+/// A thick line as a quad.
+fn line(c: &mut Canvas, a: (f32, f32), b: (f32, f32), width: f32, color: Rgb) {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len = (dx * dx + dy * dy).sqrt().max(1e-3);
+    let (nx, ny) = (-dy / len * width, dx / len * width);
+    let q = [
+        (a.0 + nx, a.1 + ny),
+        (b.0 + nx, b.1 + ny),
+        (b.0 - nx, b.1 - ny),
+        (a.0 - nx, a.1 - ny),
+    ];
+    polygon(c, &q, color);
+}
+
+/// Filled convex polygon (either winding), anti-aliased by 4×4 supersampling.
+fn polygon(c: &mut Canvas, p: &[(f32, f32)], color: Rgb) {
     let edge = |a: (f32, f32), b: (f32, f32), x: f32, y: f32| {
         (b.0 - a.0) * (y - a.1) - (b.1 - a.1) * (x - a.0)
     };
@@ -122,6 +138,7 @@ fn triangle(c: &mut Canvas, p: [(f32, f32); 3], color: Rgb) {
     let max_x = p.iter().map(|q| q.0).fold(f32::MIN, f32::max).ceil() as i32;
     let min_y = p.iter().map(|q| q.1).fold(f32::MAX, f32::min).floor() as i32;
     let max_y = p.iter().map(|q| q.1).fold(f32::MIN, f32::max).ceil() as i32;
+    let n = p.len();
     let sign = edge(p[0], p[1], p[2].0, p[2].1).signum();
     for py in min_y.max(0)..max_y.min(c.height as i32) {
         for px in min_x.max(0)..max_x.min(c.width as i32) {
@@ -132,7 +149,7 @@ fn triangle(c: &mut Canvas, p: [(f32, f32); 3], color: Rgb) {
                         px as f32 + (sx as f32 + 0.5) / 4.0,
                         py as f32 + (sy as f32 + 0.5) / 4.0,
                     );
-                    if (0..3).all(|k| edge(p[k], p[(k + 1) % 3], x, y) * sign >= 0.0) {
+                    if (0..n).all(|k| edge(p[k], p[(k + 1) % n], x, y) * sign >= 0.0) {
                         hits += 1;
                     }
                 }
