@@ -1002,7 +1002,6 @@ fn trim_freed_memory() {
 
 fn main() -> anyhow::Result<()> {
     trim_freed_memory();
-    video_box::config::migrate_old_dirs();
     let cli = Cli::parse();
     let platform = cli.platform.unwrap_or_else(Platform::current);
     let Some(command) = cli.command else {

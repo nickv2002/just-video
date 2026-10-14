@@ -17,18 +17,6 @@ binary=target/aarch64-unknown-linux-gnu/release/video-box
 [ -x "$binary" ] || { echo "Build first: scripts/build-frame.sh" >&2; exit 1; }
 host=steamos@${FRAME_HOST:-frame.local}
 ssh_opts=(-i "$HOME/.ssh/steam_frame_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes)
-# Best effort, once: the app used to be "Just Video" (~/Applications/JustVideo).
-# Remove that install and its SteamVR manifest registration. Its Steam library
-# entry (shortcuts.vdf, which Steam rewrites while running) is left for the user
-# to remove from the Steam UI; it points at the deleted launcher.
-ssh "${ssh_opts[@]}" "$host" 'rm -rf ~/Applications/JustVideo; python3 - <<"PY" || true
-import json, os
-path = os.path.expanduser("~/.config/openvr/config/appconfig.json")
-conf = json.load(open(path))
-old = os.path.expanduser("~/Applications/JustVideo/justvideo.vrmanifest")
-conf["manifest_paths"] = [p for p in conf.get("manifest_paths", []) if p != old]
-json.dump(conf, open(path, "w"), indent=3)
-PY' || true
 # No copy of the old binary is kept: to roll back, build and install an older commit.
 ssh "${ssh_opts[@]}" "$host" 'mkdir -p ~/Applications/VideoBox'
 rsync -a -e "ssh ${ssh_opts[*]}" "$binary" "$host:Applications/VideoBox/video-box"
